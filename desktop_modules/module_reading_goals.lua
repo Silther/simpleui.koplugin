@@ -33,7 +33,6 @@ local _CLR_TEXT_BLK = Blitbuffer.COLOR_BLACK
 -- All pixel constants computed once at load time.
 local GOAL_ROW_H = Screen:scaleBySize(62)
 local BAR_H      = math.max(1, math.floor(Screen:scaleBySize(10) * 0.90))
-local TOP_ROW_H  = Screen:scaleBySize(16)
 local BAR_GAP1   = Screen:scaleBySize(6)
 local BAR_GAP2   = Screen:scaleBySize(5)
 
@@ -140,19 +139,21 @@ end
 -- Builds one goal row: title + percentage on top, progress bar, sub-text below.
 -- When on_tap is provided the row becomes an InputContainer that fires the callback.
 local function buildGoalRow(inner_w, title_str, pct, pct_str, sub_str, on_tap)
+    local title_widget = TextWidget:new{
+        text    = title_str,
+        face    = Font:getFace("smallinfofont", Screen:scaleBySize(10)),
+        bold    = true,
+        fgcolor = _CLR_TEXT_BLK,
+    }
+    local top_h = title_widget:getSize().h
     local top_row = OverlapGroup:new{
-        dimen = Geom:new{ w = inner_w, h = TOP_ROW_H },
-        TextWidget:new{
-            text    = title_str,
-            face    = Font:getFace("smallinfofont", Screen:scaleBySize(13)),
-            bold    = true,
-            fgcolor = _CLR_TEXT_BLK,
-        },
+        dimen = Geom:new{ w = inner_w, h = top_h },
+        title_widget,
         RightContainer:new{
-            dimen = Geom:new{ w = inner_w, h = TOP_ROW_H },
+            dimen = Geom:new{ w = inner_w, h = top_h },
             TextWidget:new{
                 text    = pct_str,
-                face    = Font:getFace("smallinfofont", Screen:scaleBySize(13)),
+                face    = Font:getFace("smallinfofont", Screen:scaleBySize(10)),
                 bold    = true,
                 fgcolor = _CLR_TEXT_PCT,
             },
@@ -165,10 +166,11 @@ local function buildGoalRow(inner_w, title_str, pct, pct_str, sub_str, on_tap)
         buildProgressBar(inner_w, pct),
         VerticalSpan:new{ width = BAR_GAP2 },
         TextWidget:new{
-            text    = sub_str,
-            face    = Font:getFace("cfont", Screen:scaleBySize(9)),
-            fgcolor = _CLR_TEXT_SUB,
-            width   = inner_w,
+            text      = sub_str,
+            face      = Font:getFace("cfont", Screen:scaleBySize(9)),
+            fgcolor   = _CLR_TEXT_SUB,
+            width     = inner_w,
+            max_line  = 1,
         },
     }
     local row = FrameContainer:new{
@@ -305,7 +307,7 @@ function M.build(w, ctx)
     end
 
     if show_ann and show_day then
-        rows[#rows+1] = VerticalSpan:new{ width = MOD_GAP }
+        rows[#rows+1] = VerticalSpan:new{ width = MOD_GAP * 2 }
     end
 
     if show_day then
@@ -337,7 +339,7 @@ end
 
 function M.getHeight(_ctx)
     local n = (showAnnual() and 1 or 0) + (showDaily() and 1 or 0)
-    return LABEL_H + n * GOAL_ROW_H + (n == 2 and MOD_GAP or 0)
+    return LABEL_H + n * GOAL_ROW_H + (n == 2 and MOD_GAP * 2 or 0)
 end
 
 function M.getMenuItems(ctx_menu)
