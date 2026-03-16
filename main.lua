@@ -108,8 +108,11 @@ function SimpleUIPlugin:onResume()
     if RUI and not RUI.instance then
         local ok_rg, RG = pcall(require, "readinggoals")
         if ok_rg and RG and RG.Stats then RG.Stats.invalidateCache() end
-        -- Config.clearCoverCache() is NOT called here — covers don't change
-        -- between reading sessions, only progress data does.
+        -- Invalidate reading_stats cache so today/avg/streak reflect the
+        -- session that just ended. The cache is module-level and date-keyed,
+        -- so without this it would stay stale until midnight.
+        local ok_rs, RS = pcall(require, "desktop_modules/module_reading_stats")
+        if ok_rs and RS and RS.invalidateCache then RS.invalidateCache() end
     end
 end
 

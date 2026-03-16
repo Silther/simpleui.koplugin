@@ -16,6 +16,7 @@ local UIManager       = require("ui/uimanager")
 local VerticalGroup   = require("ui/widget/verticalgroup")
 local Screen          = Device.screen
 local _               = require("gettext")
+local logger          = require("logger")
 local Config          = require("config")
 
 local UI      = require("ui")
@@ -81,7 +82,7 @@ local function fetchAllStats(shared_conn)
     local conn     = shared_conn or Config.openStatsDB()
     local own_conn = not shared_conn
     if not conn then return r end
-    pcall(function()
+    local ok, err = pcall(function()
         local t           = os.date("*t")
         local start_today = os.time() - (t.hour*3600 + t.min*60 + t.sec)
         local week_start  = start_today - 6*86400
@@ -90,52 +91,81 @@ local function fetchAllStats(shared_conn)
             "SELECT sum(s) FROM (SELECT sum(duration) AS s FROM page_stat WHERE start_time>=%d GROUP BY id_book,page);",
             start_today))) or 0
 
+        -- Use '@' as separator — avoids the integer ambiguity of '-'
+        -- (page=10, id_book=1 vs page=1, id_book=01 both collapse to "10-1").
         r.today_pages = tonumber(conn:rowexec(string.format(
-            "SELECT count(DISTINCT page||'-'||id_book) FROM page_stat WHERE start_time>=%d;",
+            "SELECT count(DISTINCT page||'@'||id_book) FROM page_stat WHERE start_time>=%d;",
             start_today))) or 0
 
+        -- Aggregate per-day first (inner GROUP BY dates), then average across days
+        -- in a single outer aggregate — no outer GROUP BY.
+        -- Previous version had `GROUP BY dates` on the outer query which produced
+        -- one row per day; count(DISTINCT dates) was always 1 per group and the
+        -- inner GROUP BY id_book,page,dates inflated page counts for books read
+        -- across multiple days.
         local rw = conn:exec(string.format([[
-            SELECT count(DISTINCT dates) AS nd, sum(sd) AS tt, sum(pg) AS tp
+            SELECT count(*) AS nd, sum(sd) AS tt, sum(pg) AS tp
             FROM (SELECT strftime('%%Y-%%m-%%d',start_time,'unixepoch','localtime') AS dates,
-                         sum(duration) AS sd, count(DISTINCT page) AS pg
+                         sum(duration) AS sd,
+                         count(DISTINCT page||'@'||id_book) AS pg
                   FROM page_stat WHERE start_time>=%d
-                  GROUP BY id_book,page,dates) GROUP BY dates;]], week_start))
-        if rw and rw[1] then
-            local nd,tt,tp = #rw[1],0,0
-            for i=1,nd do tt=tt+(tonumber(rw[2][i]) or 0); tp=tp+(tonumber(rw[3][i]) or 0) end
-            if nd>0 then r.avg_secs=math.floor(tt/nd); r.avg_pages=math.floor(tp/nd) end
+                  GROUP BY dates);]], week_start))
+        if rw and rw[1] and rw[1][1] then
+            local nd = tonumber(rw[1][1]) or 0
+            local tt = tonumber(rw[2] and rw[2][1]) or 0
+            local tp = tonumber(rw[3] and rw[3][1]) or 0
+            if nd > 0 then r.avg_secs=math.floor(tt/nd); r.avg_pages=math.floor(tp/nd) end
         end
 
         r.total_secs  = tonumber(conn:rowexec("SELECT sum(duration) FROM page_stat;")) or 0
+        -- Use pre-aggregated total_read_pages from the book table instead of
+        -- recomputing via count(DISTINCT ps.page) + JOIN + GROUP BY.
+        -- total_read_pages is kept up-to-date by insertDB() in the statistics
+        -- plugin, and avoids the page-rescaling inaccuracies introduced by the
+        -- page_stat view when a book has been read across different layouts.
         r.total_books = tonumber(conn:rowexec([[
-            SELECT count(*) FROM (
-                SELECT ps.id_book,count(DISTINCT ps.page) AS pages_read,b.pages
-                FROM page_stat ps JOIN book b ON b.id=ps.id_book
-                WHERE b.pages>0 GROUP BY ps.id_book
-                HAVING CAST(pages_read AS REAL)/b.pages>=0.99)]])) or 0
+            SELECT count(*) FROM book
+            WHERE pages > 0
+              AND total_read_pages > 0
+              AND CAST(total_read_pages AS REAL) / pages >= 0.99]])) or 0
 
+        -- Streak query rewritten to avoid LIMIT inside a CTE — not supported by
+        -- the SQLite version bundled in older KOReader builds.
+        -- Strategy: use a non-recursive CTE for the distinct dates, then a
+        -- recursive CTE that walks backwards one day at a time and stops when
+        -- there is no matching date row (WHERE clause instead of LIMIT).
+        -- The outer SELECT checks that the most recent reading day is today or
+        -- yesterday before returning the count; otherwise streak = 0.
         local streak_val = conn:rowexec(string.format([[
-            WITH RECURSIVE dated AS (
-                SELECT DISTINCT date(start_time,'unixepoch','localtime') AS d
-                FROM page_stat ORDER BY d DESC),
-            streakcte(d,n) AS (
-                SELECT d,1 FROM dated LIMIT 1
+            WITH RECURSIVE
+            dated(d) AS (
+                SELECT DISTINCT date(start_time,'unixepoch','localtime')
+                FROM page_stat),
+            streak(d,n) AS (
+                SELECT d, 1 FROM dated
+                WHERE d = (SELECT max(d) FROM dated)
                 UNION ALL
-                SELECT dated.d,streakcte.n+1 FROM dated
-                JOIN streakcte ON dated.d=date(streakcte.d,'-1 day'))
-            SELECT CASE WHEN (SELECT d FROM dated LIMIT 1)>=date(%d,'unixepoch','localtime','-1 day')
-                   THEN (SELECT max(n) FROM streakcte) ELSE 0 END;]], start_today))
+                SELECT date(streak.d,'-1 day'), streak.n+1
+                FROM streak
+                WHERE EXISTS (SELECT 1 FROM dated WHERE d = date(streak.d,'-1 day')))
+            SELECT CASE
+                WHEN (SELECT max(d) FROM dated) >= date(%d,'unixepoch','localtime','-1 day')
+                THEN (SELECT max(n) FROM streak)
+                ELSE 0 END;]], start_today))
         r.streak = tonumber(streak_val) or 0
     end)
+    if not ok then logger.warn("simpleui: reading_stats: fetchAllStats failed: " .. tostring(err)) end
     if own_conn then pcall(function() conn:close() end) end
     return r
 end
 
 -- shared_conn is optional. Only used when the cache is cold (first render of
 -- the day). On cache hits the connection is never touched.
-local function getStats(shared_conn)
+-- Pass force=true to bypass the date-based cache — used after returning from
+-- a reading session so today's stats reflect the just-completed session.
+local function getStats(shared_conn, force)
     local today_s = os.date("%Y-%m-%d")
-    if _stats_cache_day == today_s and _stats_cache ~= nil then
+    if not force and _stats_cache_day == today_s and _stats_cache ~= nil then
         return _stats_cache
     end
     local result     = fetchAllStats(shared_conn)
@@ -220,7 +250,7 @@ M.STAT_POOL = STAT_POOL
 
 function M.invalidateCache()
     _stats_cache     = nil
-    _stats_cache_day = nil
+    _stats_cache_day = nil  -- force re-fetch even within the same day
 end
 
 function M.build(w, ctx)
@@ -230,6 +260,11 @@ function M.build(w, ctx)
     -- Show a placeholder when enabled but no stats have been selected yet,
     -- consistent with the empty-state pattern used by other modules.
     if #stat_ids == 0 then
+        local CenterContainer = require("ui/widget/container/centercontainer")
+        local TextWidget      = require("ui/widget/textwidget")
+        local Font            = require("ui/font")
+        local Geom            = require("ui/geometry")
+        local Device          = require("device")
         return CenterContainer:new{
             dimen = Geom:new{ w = w, h = RS_CARD_H },
             TextWidget:new{

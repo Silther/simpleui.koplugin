@@ -23,7 +23,15 @@ local M = {}
 -- Adding or renaming an icon only requires editing this one table.
 -- ---------------------------------------------------------------------------
 
-local _P  = "plugins/simpleui.koplugin/icons/"
+-- Resolve the plugin's own directory at load time so icon paths are absolute.
+-- On Android/Nook the working directory is not the KOReader root, so relative
+-- paths like "plugins/simpleui.koplugin/icons/..." silently fail to resolve
+-- while KOReader's own assets (resources/icons/mdlight/...) work because the
+-- engine has hardcoded fallbacks for its own resource tree.
+-- Using an absolute path derived from this file's location is portable across
+-- all platforms (Android, Kobo, Kindle, desktop emulator).
+local _plugin_dir = debug.getinfo(1, "S").source:match("^@(.+/)[^/]+$") or "./"
+local _P  = _plugin_dir .. "icons/"
 local _KO = "resources/icons/mdlight/"
 
 M.ICON = {

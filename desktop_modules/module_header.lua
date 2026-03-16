@@ -57,7 +57,8 @@ local _quotes_cache = nil
 -- Uses a fixed relative path — more robust than debug.getinfo on e-readers.
 local function loadQuotes()
     if _quotes_cache then return _quotes_cache end
-    local ok, data = pcall(dofile, "plugins/simpleui.koplugin/quotes.lua")
+    local _qpath = debug.getinfo(1, "S").source:match("^@(.+/)[^/]+$") or "./"
+    local ok, data = pcall(dofile, _qpath .. "quotes.lua")
     if ok and type(data) == "table" and #data > 0 then
         _quotes_cache = data
     else

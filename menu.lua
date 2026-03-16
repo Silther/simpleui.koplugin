@@ -978,14 +978,29 @@ SimpleUIPlugin.addToMainMenu = function(self, menu_items)
     plugin._makeQuickActionsMenu = makeQuickActionsMenu
 
     local function refreshHomescreen()
-        -- Use refreshImmediate (synchronous) so the homescreen widget tree is
-        -- rebuilt before the next paint — the 0.15s debounced HS.refresh() fires
-        -- while the menu is still open and the dirty region gets processed before
-        -- the menu closes, leaving the homescreen stale until the next tab switch.
+        -- Rebuild the widget tree immediately (synchronous) with keep_cache=false
+        -- so that book modules (Currently Reading, Recent Books) re-prefetch their
+        -- data. Using keep_cache=true would reuse _cached_books_state which was
+        -- built before those modules were enabled (with current_fp=nil, recent_fps={})
+        -- causing the newly-enabled modules to render empty until the next full open.
+        -- Collections and other modules have no per-instance cache so this is a
+        -- no-op cost for them.
+        --
+        -- We also schedule a setDirty via UIManager:nextTick to guarantee a repaint
+        -- AFTER the menu widget is removed from the stack. Any setDirty fired while
+        -- the menu is open is painted behind it; when the menu closes the UIManager
+        -- only repaints the menu frame region, not the full HS. nextTick runs after
+        -- the current event's onCloseWidget teardown, so the HS is the top widget
+        -- by the time the dirty is processed.
         local HS = package.loaded["homescreen"]
-        if HS and HS._instance then
-            HS._instance:_refreshImmediate(true)
-        end
+        if not (HS and HS._instance) then return end
+        local hs = HS._instance
+        hs:_refreshImmediate(false)
+        UIManager:nextTick(function()
+            if HS._instance == hs and hs._navbar_container then
+                UIManager:setDirty(hs, "ui")
+            end
+        end)
     end
 
     -- _goalTapCallback: shown when the user taps the Reading Goals widget on

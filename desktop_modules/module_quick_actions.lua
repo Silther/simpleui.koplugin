@@ -11,6 +11,7 @@ local FrameContainer  = require("ui/widget/container/framecontainer")
 local Geom            = require("ui/geometry")
 local GestureRange    = require("ui/gesturerange")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
+local HorizontalSpan  = require("ui/widget/horizontalspan")
 local ImageWidget     = require("ui/widget/imagewidget")
 local InputContainer  = require("ui/widget/container/inputcontainer")
 local TextWidget      = require("ui/widget/textwidget")
@@ -170,12 +171,9 @@ local function buildQAWidget(w, action_ids, show_labels, on_tap_fn)
         end
 
         if i > 1 then
-            row[#row + 1] = FrameContainer:new{
-                bordersize = 0, padding = 0, padding_left = gap, tappable,
-            }
-        else
-            row[#row + 1] = tappable
+            row[#row + 1] = HorizontalSpan:new{ width = gap }
         end
+        row[#row + 1] = tappable
     end
 
     return FrameContainer:new{

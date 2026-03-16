@@ -382,10 +382,161 @@ end
 -- Exported so patches.lua can delegate to it instead of duplicating the body (#3).
 M.setActiveAndRefreshFM = setActiveAndRefreshFM
 
+-- ---------------------------------------------------------------------------
+-- classify_action: returns true when the action is "in-place" (executes
+-- without opening a new fullscreen view) and must NOT close the homescreen.
+-- Returns false for navigation actions that open a different screen.
+-- ---------------------------------------------------------------------------
+local function _isInPlaceAction(action_id)
+    if action_id == "wifi_toggle" then return true end
+    if action_id == "frontlight"  then return true end
+    if action_id == "power"       then return true end
+    if action_id == "stats_calendar" then return true end
+    if action_id:match("^custom_qa_%d+$") then
+        local cfg = Config.getCustomQAConfig(action_id)
+        -- dispatcher_action and plugin_method are in-place (they toggle state
+        -- or call a plugin method without opening a new fullscreen widget).
+        -- collection and path navigate away — those must close the HS.
+        if cfg.dispatcher_action and cfg.dispatcher_action ~= "" then return true end
+        if cfg.plugin_key and cfg.plugin_method and cfg.plugin_key ~= "" then return true end
+    end
+    return false
+end
+
+-- ---------------------------------------------------------------------------
+-- _executeInPlace: runs an in-place action while keeping the HS open.
+-- The HS is temporarily moved to the bottom of the window stack so that
+-- Dispatcher:sendEvent and broadcastEvent reach FM plugins correctly.
+-- After execution the HS is restored to the top and repainted.
+-- ---------------------------------------------------------------------------
+local function _executeInPlace(action_id, plugin, fm)
+    local HS      = package.loaded["homescreen"]
+    local hs_inst = HS and HS._instance
+    local UI_mod  = require("ui")
+    local stack   = UI_mod.getWindowStack()
+    local hs_idx  = nil
+
+    -- Sink the HS to position 1 so FM plugins receive events normally.
+    if hs_inst then
+        for i, entry in ipairs(stack) do
+            if entry.widget == hs_inst then hs_idx = i; break end
+        end
+        if hs_idx and hs_idx > 1 then
+            local entry = table.remove(stack, hs_idx)
+            table.insert(stack, 1, entry)
+        end
+    end
+
+    if action_id == "wifi_toggle" then
+        M.doWifiToggle(plugin)
+
+    elseif action_id == "frontlight" then
+        M.showFrontlightDialog()
+
+    elseif action_id == "power" then
+        M.showPowerDialog(plugin)
+
+    elseif action_id == "stats_calendar" then
+        local ok, err = pcall(function()
+            UIManager:broadcastEvent(require("ui/event"):new("ShowCalendarView"))
+        end)
+        if not ok then showUnavailable(_("Statistics plugin not available.")) end
+
+    elseif action_id:match("^custom_qa_%d+$") then
+        local cfg = Config.getCustomQAConfig(action_id)
+        if cfg.dispatcher_action and cfg.dispatcher_action ~= "" then
+            local ok_disp, Dispatcher = pcall(require, "dispatcher")
+            if ok_disp and Dispatcher then
+                local ok, err = pcall(function()
+                    Dispatcher:execute({ [cfg.dispatcher_action] = true })
+                end)
+                if not ok then
+                    logger.warn("simpleui: dispatcher_action failed:", cfg.dispatcher_action, tostring(err))
+                    showUnavailable(string.format(_("System action error: %s"), tostring(err)))
+                end
+            else
+                showUnavailable(_("Dispatcher not available."))
+            end
+        elseif cfg.plugin_key and cfg.plugin_method and cfg.plugin_key ~= "" then
+            local plugin_inst = fm and fm[cfg.plugin_key]
+            if plugin_inst and type(plugin_inst[cfg.plugin_method]) == "function" then
+                local ok, err = pcall(function() plugin_inst[cfg.plugin_method](plugin_inst) end)
+                if not ok then showUnavailable(string.format(_("Plugin error: %s"), tostring(err))) end
+            else
+                showUnavailable(string.format(_("Plugin not available: %s"), cfg.plugin_key))
+            end
+        end
+    end
+
+    -- Restore HS to its original position and repaint to reflect any changes
+    -- from the action (e.g. nightmode inversion, frontlight level update).
+    if hs_inst and hs_idx and hs_idx > 1 then
+        for i, entry in ipairs(stack) do
+            if entry.widget == hs_inst then
+                local e = table.remove(stack, i)
+                table.insert(stack, hs_idx, e)
+                break
+            end
+        end
+    end
+    UIManager:setDirty(hs_inst or fm, "ui")
+end
+
 function M.navigate(plugin, action_id, fm_self, tabs, force)
     local fm = plugin.ui
 
-    -- Close any open sub-window before navigating.
+    -- Detect if the homescreen is currently open (fm_self is the FM but the
+    -- HS is on top — the tap came through the HS's injected bottombar).
+    local HS = package.loaded["homescreen"]
+    local hs_open = HS and HS._instance ~= nil
+
+    -- In-place actions (toggle nightmode, frontlight, wifi, dispatcher, etc.)
+    -- must NOT close the homescreen. Execute them directly and return.
+    if hs_open and _isInPlaceAction(action_id) then
+        _executeInPlace(action_id, plugin, fm)
+        return
+    end
+
+    if hs_open then
+        -- Navigate the FM while it's still covered by the HS.
+        if action_id == "home" then
+            local home = G_reader_settings:readSetting("home_dir")
+            if home then
+                if fm.file_chooser then
+                    fm.file_chooser:changeToPath(home)
+                    UIManager:setDirty(fm, "partial")
+                else
+                    -- file_chooser not yet created (FM is still initializing
+                    -- after being rebuilt post-reader). The HS close below will
+                    -- trigger a repaint that wakes the UIManager, so scheduleIn(0)
+                    -- will run in the very next event cycle.
+                    UIManager:scheduleIn(0, function()
+                        local live = plugin.ui
+                        if live and live.file_chooser then
+                            live.file_chooser:changeToPath(home)
+                            UIManager:setDirty(live, "partial")
+                        end
+                    end)
+                end
+            end
+        end
+        -- Close the HS before navigating to a new screen.
+        local hs_inst = HS._instance
+        hs_inst._navbar_closing_intentionally = true
+        pcall(function() UIManager:close(hs_inst) end)
+        hs_inst._navbar_closing_intentionally = nil
+        -- Update the FM bar.
+        if fm._navbar_container then
+            M.replaceBar(fm, M.buildBarWidget(action_id, tabs), tabs)
+            UIManager:setDirty(fm, "ui")
+        end
+        -- For "home" we're done — FM is already at the right path.
+        if action_id == "home" then return end
+        -- For other actions, fall through with fm_self = fm.
+        fm_self = fm
+    end
+
+    -- Close any open sub-window before navigating (non-HS case).
     if fm_self ~= fm then
         fm_self._navbar_closing_intentionally = true
         pcall(function()
@@ -395,23 +546,19 @@ function M.navigate(plugin, action_id, fm_self, tabs, force)
         fm_self._navbar_closing_intentionally = nil
     end
 
-
     if fm_self ~= fm and fm._navbar_container then
         M.replaceBar(fm, M.buildBarWidget(action_id, tabs), tabs)
         UIManager:setDirty(fm, "ui")
     end
 
     if action_id == "home" then
+        local live_fm = plugin.ui or fm
         local home = G_reader_settings:readSetting("home_dir")
-        if home and fm.file_chooser then
-            fm.file_chooser:changeToPath(home)
-            -- changeToPath already rebuilds the FileChooser and fires
-            -- onPathChanged → replaceBar + setDirty. refreshPath() here
-            -- would be a second redundant FileChooser rebuild on the same
-            -- path. A single partial dirty is sufficient when force=true.
-            if force then UIManager:setDirty(fm, "partial") end
-        elseif fm.onHome then
-            fm:onHome()
+        if home and live_fm.file_chooser then
+            live_fm.file_chooser:changeToPath(home)
+            if force then UIManager:setDirty(live_fm, "partial") end
+        elseif live_fm.file_chooser then
+            UIManager:setDirty(live_fm, "partial")
         end
 
     elseif action_id == "collections" then
@@ -425,7 +572,15 @@ function M.navigate(plugin, action_id, fm_self, tabs, force)
     elseif action_id == "homescreen" then
         local ok_hs, HS = pcall(require, "homescreen")
         if ok_hs and HS and type(HS.show) == "function" then
-            local on_qa_tap   = function(aid) plugin:_onTabTap(aid, fm) end
+            local tabs = Config.loadTabConfig()
+            -- QA taps from the homescreen must NOT go through _onTabTap:
+            -- _onTabTap calls replaceBar(fm) which schedules a full FM repaint,
+            -- and that repaint fires after the homescreen closes and interferes
+            -- with dispatcher_action widgets that try to open on top of the FM.
+            -- Call navigate directly with fm as the target — no bar replacement.
+            local on_qa_tap = function(aid)
+                plugin:_navigate(aid, fm, tabs, false)
+            end
             local on_goal_tap = plugin._goalTapCallback or nil
             HS.show(on_qa_tap, on_goal_tap)
         else
@@ -449,7 +604,6 @@ function M.navigate(plugin, action_id, fm_self, tabs, force)
             showUnavailable(_("No book in history."))
         end
 
-
     elseif action_id == "stats_calendar" then
         -- broadcastEvent reaches all widgets on the stack (including fm.statistics
         -- which is a registered FM plugin) regardless of which widget is on top.
@@ -469,13 +623,19 @@ function M.navigate(plugin, action_id, fm_self, tabs, force)
     else
         if action_id:match("^custom_qa_%d+$") then
             local cfg = Config.getCustomQAConfig(action_id)
+            -- dispatcher_action and plugin_method are handled by _executeInPlace
+            -- when the HS is open (caught by _isInPlaceAction above). This branch
+            -- only runs when the HS is already closed (e.g. tap from the FM bar).
             if cfg.dispatcher_action and cfg.dispatcher_action ~= "" then
                 local ok_disp, Dispatcher = pcall(require, "dispatcher")
                 if ok_disp and Dispatcher then
                     local ok, err = pcall(function()
                         Dispatcher:execute({ [cfg.dispatcher_action] = true })
                     end)
-                    if not ok then showUnavailable(string.format(_("System action error: %s"), tostring(err))) end
+                    if not ok then
+                        logger.warn("simpleui: dispatcher_action failed:", cfg.dispatcher_action, tostring(err))
+                        showUnavailable(string.format(_("System action error: %s"), tostring(err)))
+                    end
                 else
                     showUnavailable(_("Dispatcher not available."))
                 end

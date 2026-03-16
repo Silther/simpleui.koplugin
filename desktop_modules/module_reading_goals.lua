@@ -103,16 +103,16 @@ local function getGoalStats(shared_conn)
                 WHERE start_time >= %d GROUP BY id_book, page);]], today_start))
         today_secs = tonumber(rt) or 0
 
+        -- Use pre-aggregated total_read_pages from the book table instead of
+        -- recomputing via count(DISTINCT ps.page) + JOIN + GROUP BY.
+        -- total_read_pages is kept up-to-date by insertDB() in the statistics
+        -- plugin, and avoids the page-rescaling inaccuracies introduced by the
+        -- page_stat view when a book has been read across different layouts.
         local tb = conn:rowexec([[
-            SELECT count(*) FROM (
-                SELECT ps.id_book,
-                       count(DISTINCT ps.page) AS pages_read,
-                       b.pages
-                FROM page_stat ps
-                JOIN book b ON b.id = ps.id_book
-                WHERE b.pages > 0
-                GROUP BY ps.id_book
-                HAVING CAST(pages_read AS REAL) / b.pages >= 0.99);]])
+            SELECT count(*) FROM book
+            WHERE pages > 0
+              AND total_read_pages > 0
+              AND CAST(total_read_pages AS REAL) / pages >= 0.99]])
         books_read = tonumber(tb) or 0
     end)
 

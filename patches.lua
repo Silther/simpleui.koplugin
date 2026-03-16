@@ -1,13 +1,5 @@
 -- patches.lua — Simple UI
--- Monkey-patches applied to KOReader on plugin load:
---   FileManager.setupLayout  — navbar injection, title bar, homescreen boot
---   FileChooser.init         — corrected content height
---   BookList.new             — corrected content height
---   Menu.new + FMColl        — collections with corrected height
---   SortWidget.new + PathChooser.new — fullscreen widget height + title padding
---   UIManager.show           — navbar injection for fullscreen widgets
---   UIManager.close          — tab restore + homescreen re-open
---   Menu.init                — pagination bar removal
+-- Monkey-patches applied to KOReader on plugin load.
 
 local UIManager  = require("ui/uimanager")
 local Screen     = require("device").screen
@@ -18,25 +10,43 @@ local Config    = require("config")
 local UI        = require("ui")
 local Bottombar = require("bottombar")
 
--- Cached zero-size Geom used to hide the right title bar button on injected widgets.
--- Allocated once at module load; never mutated.
-local _Geom     = require("ui/geometry")
-local _ZERO_DIMEN = _Geom:new{ w = 0, h = 0 }
+-- Zero-size Geom used to hide the right title bar button on injected widgets.
+local _ZERO_DIMEN = require("ui/geometry"):new{ w = 0, h = 0 }
 
 local M = {}
 
--- Reused for UIManager.show calls that pass no extra args (avoids table allocation).
+-- Sentinel table reused for UIManager.show calls with no extra args,
+-- avoiding a table allocation on every call.
 local _EMPTY = {}
 
--- Survives plugin re-instantiation (new instance per FM rebuild) because
--- patches.lua stays in package.loaded for the whole session.
--- Prevents the homescreen auto-open from firing on every FM rebuild after
--- closing the reader — only fires once, on the initial boot FM.
--- Cleared in teardownAll so a disable/re-enable starts fresh.
+-- Persists across plugin re-instantiation because patches.lua stays in
+-- package.loaded for the whole session. Prevents the homescreen auto-open
+-- from firing more than once (only on the initial boot FM).
+-- Cleared in teardownAll so a disable/re-enable cycle starts fresh.
 local _hs_boot_done = false
 
--- Linear search over tabs (typically 3–6 entries). Avoids allocating a hash
--- table on every UIManager.show injection path.
+-- Set to true when ReaderUI closes with "Start with Homescreen" active.
+-- Picked up by the next setupLayout call to defer the FM paint until after
+-- the homescreen is open, eliminating the flash between reader and homescreen.
+local _hs_pending_after_reader = false
+
+-- Cached result of the "start_with == homescreen_simpleui" setting.
+-- nil means stale; invalidated in teardownAll and updated in patchStartWithMenu.
+local _start_with_hs = nil
+
+-- Returns true when "Start with Homescreen" is the active start_with value.
+-- Caches the result so UIManager.show and UIManager.close (hot paths) avoid
+-- repeated settings lookups on every call.
+local function isStartWithHS()
+    if _start_with_hs == nil then
+        _start_with_hs = G_reader_settings:readSetting("start_with", "filemanager") == "homescreen_simpleui"
+    end
+    return _start_with_hs
+end
+
+-- Linear search over the tab list (typically 3–6 entries).
+-- Used only in single-call contexts (boot, onReturn hook). Hot paths
+-- in UIManager.show build a set instead to avoid repeated scans.
 local function tabInTabs(id, tabs)
     for _, v in ipairs(tabs) do
         if v == id then return true end
@@ -44,9 +54,16 @@ local function tabInTabs(id, tabs)
     return false
 end
 
+-- Builds a set from a tab list for O(1) membership tests.
+local function tabsToSet(tabs)
+    local s = {}
+    for _, v in ipairs(tabs) do s[v] = true end
+    return s
+end
+
 -- ---------------------------------------------------------------------------
 -- FileManager.setupLayout
--- Injects the navbar, fixes the title bar, and wires up onShow / onPathChanged.
+-- Injects the navbar, patches the title bar, and wires up onShow / onPathChanged.
 -- ---------------------------------------------------------------------------
 
 function M.patchFileManagerClass(plugin)
@@ -58,8 +75,8 @@ function M.patchFileManagerClass(plugin)
         local topbar_on = G_reader_settings:nilOrTrue("navbar_topbar_enabled")
         fm_self._navbar_height = Bottombar.TOTAL_H() + (topbar_on and require("topbar").TOTAL_TOP_H() or 0)
 
-        -- FileChooser.init: reduce height to content area. Patched once on the
-        -- class (guarded by _navbar_patched) so repeated FM rebuilds don't re-wrap.
+        -- Patch FileChooser.init once on the class so repeated FM rebuilds
+        -- don't re-wrap. Reduces height to the content area.
         local FileChooser = require("ui/widget/filechooser")
         if not FileChooser._navbar_patched then
             local orig_fc_init   = FileChooser.init
@@ -76,8 +93,8 @@ function M.patchFileManagerClass(plugin)
 
         orig_setupLayout(fm_self)
 
-        -- Title bar: swap right button icon and intercept setRightIcon so the
-        -- custom icon is preserved whenever KOReader resets it to "plus".
+        -- Swap the right title bar button icon to plus_alt and intercept
+        -- setRightIcon so the custom icon is preserved when KOReader resets it.
         local PLUS_ALT_ICON = Config.ICON.plus_alt
         local tb = fm_self.title_bar
         if tb and tb.right_button then
@@ -99,7 +116,7 @@ function M.patchFileManagerClass(plugin)
             end
         end
 
-        -- Title bar: reposition right button as the menu trigger; hide left button.
+        -- Reposition the right button as the menu trigger and hide the left button.
         if tb and tb.left_button and tb.right_button then
             local rb = tb.right_button
             if rb.image then
@@ -117,8 +134,8 @@ function M.patchFileManagerClass(plugin)
         end
         if tb and tb.setTitle then tb:setTitle(_("Library")) end
 
-        -- Preserve the original inner widget reference so re-wrapping on
-        -- subsequent setupLayout calls wraps the same widget, not the wrapper.
+        -- Keep the original inner widget reference so re-wrapping on subsequent
+        -- setupLayout calls wraps the same widget instead of the wrapper.
         local inner_widget
         if fm_self._navbar_inner then
             inner_widget = fm_self._navbar_inner
@@ -136,46 +153,48 @@ function M.patchFileManagerClass(plugin)
 
         plugin:_updateFMHomeIcon()
 
-        -- Boot-time homescreen auto-open: only fires on the first FM instance
-        -- (boot). Subsequent FMs (after closing the reader) skip this block
-        -- because _hs_boot_done is a module-level local that persists across
-        -- plugin re-instantiation.
+        -- On boot only: if "Start with Homescreen" is active and the homescreen
+        -- tab exists, defer opening the HS until onShow fires (FM must be on stack).
         if not _hs_boot_done then
             _hs_boot_done = true
-            if G_reader_settings:readSetting("start_with", "filemanager") == "homescreen_simpleui"
-                    and tabInTabs("homescreen", tabs) then
+            if isStartWithHS() and tabInTabs("homescreen", tabs) then
                 plugin.active_action = "homescreen"
                 fm_self._hs_autoopen_pending = true
             end
         end
 
         -- onShow fires once the FM is on the UIManager stack.
-        -- Handles both the boot homescreen open and the normal bar refresh.
         local orig_onShow = fm_self.onShow
         fm_self.onShow = function(this)
             if orig_onShow then orig_onShow(this) end
             Bottombar.resizePaginationButtons(this.file_chooser or this, Bottombar.getPaginationIconSize())
 
-            -- Homescreen must be opened after the FM is on the stack;
-            -- _hs_autoopen_pending is the deferred signal from setupLayout above.
+            -- Open the homescreen if this FM was flagged at setupLayout time.
             if this._hs_autoopen_pending then
                 this._hs_autoopen_pending = nil
                 UIManager:scheduleIn(0, function()
-                    local HS = package.loaded["homescreen"] or (function()
-                        local ok, m = pcall(require, "homescreen"); return ok and m
-                    end)()
+                    local HS = package.loaded["homescreen"]
+                    if not HS then
+                        local ok, m = pcall(require, "homescreen")
+                        HS = ok and m
+                    end
                     if HS then
                         if not plugin._goalTapCallback then plugin:addToMainMenu({}) end
-                        HS.show(function(aid) plugin:_onTabTap(aid, this) end, plugin._goalTapCallback)
+                        local t = Config.loadTabConfig()
+                        HS.show(function(aid) plugin:_navigate(aid, this, t, false) end, plugin._goalTapCallback)
                     end
                 end)
                 return
             end
 
-            -- Normal FM show: reset active tab to "home" and refresh the bar.
+            -- Normal FM show: reset the active tab to "home" and navigate to home_dir.
             if this._navbar_container then
                 local t = Config.loadTabConfig()
                 plugin.active_action = "home"
+                local home = G_reader_settings:readSetting("home_dir")
+                if home and this.file_chooser then
+                    this.file_chooser:changeToPath(home)
+                end
                 Bottombar.replaceBar(this, Bottombar.buildBarWidget("home", t), t)
                 UIManager:setDirty(this, "ui")
             end
@@ -184,8 +203,6 @@ function M.patchFileManagerClass(plugin)
         plugin:_registerTouchZones(fm_self)
 
         -- onPathChanged: update the active tab when the user navigates directories.
-        -- Falls back to "home" when the path does not match any configured tab,
-        -- since the FM is always showing the file browser (Library).
         fm_self.onPathChanged = function(this, new_path)
             local t          = Config.loadTabConfig()
             local new_active = M._resolveTabForPath(new_path, t) or "home"
@@ -223,15 +240,15 @@ end
 -- ---------------------------------------------------------------------------
 -- FileManagerMenu.getStartWithMenuTable
 -- Injects "Home Screen" into KOReader's Start With submenu.
--- Guarded: only patches once per session (flag on the class itself).
+-- Patched once per session; guarded by a flag on the class itself.
 -- ---------------------------------------------------------------------------
 
 function M.patchStartWithMenu()
     local FileManagerMenu = package.loaded["apps/filemanager/filemanagermenu"]
-        or (function()
-            local ok, m = pcall(require, "apps/filemanager/filemanagermenu")
-            return ok and m
-        end)()
+    if not FileManagerMenu then
+        local ok, m = pcall(require, "apps/filemanager/filemanagermenu")
+        FileManagerMenu = ok and m or nil
+    end
     if not FileManagerMenu then return end
     if FileManagerMenu._simpleui_startwith_patched then return end
     local orig_fn = FileManagerMenu.getStartWithMenuTable
@@ -242,7 +259,7 @@ function M.patchStartWithMenu()
         local result = orig_fn(fmm_self)
         local sub = result.sub_item_table
         if type(sub) ~= "table" then return result end
-        -- Guard against the entry already being present (re-entrancy safety).
+        -- Guard against the entry already being present.
         local has_homescreen = false
         for _i, item in ipairs(sub) do
             if item.text == _("Home Screen") and item.radio then has_homescreen = true end
@@ -250,19 +267,18 @@ function M.patchStartWithMenu()
         if not has_homescreen then
             table.insert(sub, math.max(1, #sub), {
                 text         = _("Home Screen"),
-                checked_func = function()
-                    return G_reader_settings:readSetting("start_with", "filemanager") == "homescreen_simpleui"
-                end,
+                checked_func = function() return isStartWithHS() end,
                 callback = function()
                     G_reader_settings:saveSetting("start_with", "homescreen_simpleui")
+                    _start_with_hs = true  -- update cache immediately
                 end,
                 radio = true,
             })
         end
-        -- Update the parent item's display text to reflect "Home Screen" when selected.
+        -- Update the parent item text when "Home Screen" is the active choice.
         local orig_text_func = result.text_func
         result.text_func = function()
-            if G_reader_settings:readSetting("start_with", "filemanager") == "homescreen_simpleui" then
+            if isStartWithHS() then
                 return _("Start with") .. ": " .. _("Home Screen")
             end
             return orig_text_func and orig_text_func() or _("Start with")
@@ -293,8 +309,8 @@ end
 
 -- ---------------------------------------------------------------------------
 -- FMColl.onShowCollList + Menu.new + ReadCollection
--- Reduces the coll_list Menu height. patch_depth gates Menu.new so only
--- menus created during onShowCollList are affected.
+-- Reduces the coll_list Menu height to the content area. patch_depth gates
+-- Menu.new so only menus created during onShowCollList are affected.
 -- Also syncs the SimpleUI collections pool when KOReader renames/deletes.
 -- ---------------------------------------------------------------------------
 
@@ -316,6 +332,7 @@ function M.patchCollections(plugin)
         return result
     end
 
+    -- Intercept Menu.new only while onShowCollList is on the call stack.
     Menu.new = function(class, attrs, ...)
         attrs = attrs or {}
         if patch_depth > 0
@@ -379,12 +396,13 @@ function M.patchCollections(plugin)
         plugin._orig_rc_remove = orig_remove
         RC.removeCollection = function(rc_self, coll_name, ...)
             local result = orig_remove(rc_self, coll_name, ...)
-            pcall(function()
+            local ok2, err = pcall(function()
                 _removeFromPool(coll_name)
                 Config.purgeQACollection(coll_name)
                 Config.invalidateTabsCache()
                 plugin:_scheduleRebuild()
             end)
+            if not ok2 then logger.warn("simpleui: removeCollection hook:", tostring(err)) end
             return result
         end
     end
@@ -394,11 +412,12 @@ function M.patchCollections(plugin)
         plugin._orig_rc_rename = orig_rename
         RC.renameCollection = function(rc_self, old_name, new_name, ...)
             local result = orig_rename(rc_self, old_name, new_name, ...)
-            pcall(function()
+            local ok2, err = pcall(function()
                 _renameInPool(old_name, new_name)
                 Config.renameQACollection(old_name, new_name)
                 plugin:_scheduleRebuild()
             end)
+            if not ok2 then logger.warn("simpleui: renameCollection hook:", tostring(err)) end
             return result
         end
     end
@@ -406,8 +425,8 @@ end
 
 -- ---------------------------------------------------------------------------
 -- SortWidget.new + PathChooser.new
--- Reduces height to content area. SortWidget also gets title padding and a
--- _populateItems hook to force a repaint after each sort operation.
+-- Reduces height to the content area. SortWidget also gets title padding and
+-- a _populateItems hook to force a repaint after each sort operation.
 -- ---------------------------------------------------------------------------
 
 function M.patchFullscreenWidgets(plugin)
@@ -425,7 +444,7 @@ function M.patchFullscreenWidgets(plugin)
                 attrs.y                      = UI.getContentTop()
                 attrs._navbar_height_reduced = true
             end
-            -- Temporarily override TitleBar.new to inject horizontal padding,
+            -- Temporarily wrap TitleBar.new to inject horizontal padding,
             -- then restore it immediately after SortWidget is constructed.
             local orig_tb_new
             if ok_tb and TitleBar and attrs.covers_fullscreen then
@@ -476,37 +495,82 @@ end
 
 -- ---------------------------------------------------------------------------
 -- UIManager.show
--- Injects the navbar into qualifying fullscreen widgets. Also closes the
--- homescreen when any other fullscreen widget is shown on top of it.
--- _show_depth prevents re-entrant injection when orig_show itself calls show.
+-- Injects the navbar into qualifying fullscreen widgets and closes the
+-- homescreen when any other fullscreen widget appears on top of it.
+-- _show_depth prevents re-entrant injection when orig_show calls show again.
 -- ---------------------------------------------------------------------------
 
 function M.patchUIManagerShow(plugin)
-    local orig_show  = UIManager.show
+    local orig_show = UIManager.show
     plugin._orig_uimanager_show = orig_show
     local _show_depth = 0
 
     local INJECT_NAMES = { collections = true, history = true, coll_list = true, homescreen = true }
 
+    -- Resolves the live FileManager menu at call time, never capturing a stale
+    -- reference. The FM is destroyed and recreated each time the reader closes,
+    -- so a closure over the old FM's .menu would point at ReaderMenu and crash.
+    -- Defined once here, shared across all injected widgets.
+    local function _fmMenu()
+        local live_fm = plugin.ui
+        if live_fm and live_fm.menu
+                and type(live_fm.menu.name) == "string"
+                and live_fm.menu.name:find("filemanager") then
+            return live_fm.menu
+        end
+        local FM2 = package.loaded["apps/filemanager/filemanager"]
+        local inst = FM2 and FM2.instance
+        if inst and inst.menu then return inst.menu end
+        return nil
+    end
+
     UIManager.show = function(um_self, widget, ...)
-        -- Capture varargs before the pcall closure (Lua does not propagate '...' into nested functions).
-        -- Reuse _EMPTY when there are no extra args to avoid a table allocation on every call.
+        -- Capture varargs before the pcall closure; reuse _EMPTY when none present.
         local n_extra    = select("#", ...)
         local extra_args = n_extra > 0 and { ... } or _EMPTY
         _show_depth = _show_depth + 1
 
-        -- Wrap body in pcall so _show_depth is always decremented even on error.
+        -- Wrap the body in pcall so _show_depth is always decremented on error.
         local ok, result = pcall(function()
 
+        -- When the FM appears after the reader closes with "Start with Homescreen"
+        -- active, show it silently first then immediately open the HS on top,
+        -- eliminating the flash of the FM before the homescreen appears.
+        if _show_depth == 1 and _hs_pending_after_reader
+                and widget and widget == plugin.ui
+                and isStartWithHS() then
+            _hs_pending_after_reader = false
+            if n_extra > 0 then
+                orig_show(um_self, widget, table.unpack(extra_args))
+            else
+                orig_show(um_self, widget)
+            end
+            local HS = package.loaded["homescreen"]
+            if not HS then
+                local ok2, m = pcall(require, "homescreen")
+                HS = ok2 and m
+            end
+            if HS and not HS._instance then
+                if not plugin._goalTapCallback then plugin:addToMainMenu({}) end
+                local tabs = Config.loadTabConfig()
+                Bottombar.setActiveAndRefreshFM(plugin, "homescreen", tabs)
+                HS.show(
+                    function(aid) plugin:_navigate(aid, widget, tabs, false) end,
+                    plugin._goalTapCallback
+                )
+            end
+            return
+        end
+
         -- Injection criteria: top-level show, fullscreen, not already injected,
-        -- has a title bar (excludes ReaderUI), and is either pre-sized or in INJECT_NAMES.
+        -- has a title bar (excludes ReaderUI), and is pre-sized or in INJECT_NAMES.
         local should_inject = _show_depth == 1
             and widget
             and not widget._navbar_injected
             and not widget._navbar_skip_inject
             and widget ~= plugin.ui
             and widget.covers_fullscreen
-            and widget.title_bar ~= nil
+            and widget.title_bar      -- truthiness check, not ~= nil
             and (widget._navbar_height_reduced or (widget.name and INJECT_NAMES[widget.name]))
 
         if not should_inject then
@@ -519,7 +583,7 @@ function M.patchUIManagerShow(plugin)
 
         widget._navbar_injected = true
 
-        -- Resize widget and its first child to the content area when not already sized.
+        -- Resize widget and its first child to the content area when not pre-sized.
         if not widget._navbar_height_reduced then
             local content_h   = UI.getContentHeight()
             local content_top = UI.getContentTop()
@@ -534,7 +598,7 @@ function M.patchUIManagerShow(plugin)
             widget._navbar_height_reduced = true
         end
 
-        -- Reposition left button inside content area; hide right button.
+        -- Reposition the left title bar button; hide the right one.
         local tb = widget.title_bar
         if tb then
             if tb.left_button then
@@ -550,11 +614,14 @@ function M.patchUIManagerShow(plugin)
         end
 
         local tabs          = Config.loadTabConfig()
+        -- Build a set for O(1) membership tests — avoids repeated linear scans
+        -- over the same tab list for each widget name check below.
+        local tabs_set      = tabsToSet(tabs)
         local action_before = plugin.active_action
         local effective_action = nil
 
-        -- Set the active tab to match the widget being shown.
-        if widget.name == "collections" and Config.isFavoritesWidget(widget) and tabInTabs("favorites", tabs) then
+        -- Activate the tab that corresponds to the widget being shown.
+        if widget.name == "collections" and Config.isFavoritesWidget(widget) and tabs_set["favorites"] then
             effective_action = Bottombar.setActiveAndRefreshFM(plugin, "favorites", tabs)
             local orig_onReturn = widget.onReturn
             if orig_onReturn then
@@ -563,13 +630,13 @@ function M.patchUIManagerShow(plugin)
                     return orig_onReturn(w_self, ...)
                 end
             end
-        elseif widget.name == "history" and tabInTabs("history", tabs) then
+        elseif widget.name == "history" and tabs_set["history"] then
             effective_action = Bottombar.setActiveAndRefreshFM(plugin, "history", tabs)
-        elseif widget.name == "homescreen" and tabInTabs("homescreen", tabs) then
+        elseif widget.name == "homescreen" and tabs_set["homescreen"] then
             effective_action = Bottombar.setActiveAndRefreshFM(plugin, "homescreen", tabs)
         elseif widget.name == "coll_list"
                or (widget.name == "collections" and not Config.isFavoritesWidget(widget)) then
-            if tabInTabs("collections", tabs) then
+            if tabs_set["collections"] then
                 effective_action = Bottombar.setActiveAndRefreshFM(plugin, "collections", tabs)
             end
         end
@@ -590,7 +657,6 @@ function M.patchUIManagerShow(plugin)
             local DTAP_ZONE_MENU     = G_defaults:readSetting("DTAP_ZONE_MENU")
             local DTAP_ZONE_MENU_EXT = G_defaults:readSetting("DTAP_ZONE_MENU_EXT")
             if DTAP_ZONE_MENU and DTAP_ZONE_MENU_EXT then
-                local fm = plugin.ui
                 widget:registerTouchZones({
                     {
                         id          = "simpleui_menu_tap",
@@ -600,7 +666,7 @@ function M.patchUIManagerShow(plugin)
                             ratio_w = DTAP_ZONE_MENU.w, ratio_h = DTAP_ZONE_MENU.h,
                         },
                         handler = function(ges)
-                            if fm and fm.menu then return fm.menu:onTapShowMenu(ges) end
+                            local m = _fmMenu(); if m then return m:onTapShowMenu(ges) end
                         end,
                     },
                     {
@@ -612,7 +678,7 @@ function M.patchUIManagerShow(plugin)
                         },
                         overrides = { "simpleui_menu_tap" },
                         handler = function(ges)
-                            if fm and fm.menu then return fm.menu:onTapShowMenu(ges) end
+                            local m = _fmMenu(); if m then return m:onTapShowMenu(ges) end
                         end,
                     },
                     {
@@ -623,7 +689,7 @@ function M.patchUIManagerShow(plugin)
                             ratio_w = DTAP_ZONE_MENU.w, ratio_h = DTAP_ZONE_MENU.h,
                         },
                         handler = function(ges)
-                            if fm and fm.menu then return fm.menu:onSwipeShowMenu(ges) end
+                            local m = _fmMenu(); if m then return m:onSwipeShowMenu(ges) end
                         end,
                     },
                     {
@@ -635,14 +701,14 @@ function M.patchUIManagerShow(plugin)
                         },
                         overrides = { "simpleui_menu_swipe" },
                         handler = function(ges)
-                            if fm and fm.menu then return fm.menu:onSwipeShowMenu(ges) end
+                            local m = _fmMenu(); if m then return m:onSwipeShowMenu(ges) end
                         end,
                     },
                 })
             end
         end
 
-        -- Resize the return button to match the side margin.
+        -- Resize the return button width to match the side margin.
         local rb = widget.return_button
         if rb and rb[1] then rb[1].width = UI.SIDE_M() end
 
@@ -661,10 +727,12 @@ function M.patchUIManagerShow(plugin)
             logger.warn("simpleui: UIManager.show patch error:", tostring(result))
         end
 
-        -- Close the homescreen if another fullscreen widget just appeared on top.
-        -- Runs regardless of whether injection happened (covers ReaderUI too).
+        -- Close the homescreen if a different fullscreen widget just appeared on top.
+        -- Runs regardless of injection; also covers native KOReader widgets (ReaderUI).
+        -- Excludes the FM itself: the FM opening the HS in onShow must not close it here.
         if _show_depth == 0 and widget and widget.covers_fullscreen
-                and widget.name ~= "homescreen" then
+                and widget.name ~= "homescreen"
+                and widget ~= plugin.ui then
             local stack = UI.getWindowStack()
             for _i, entry in ipairs(stack) do
                 local w = entry.widget
@@ -683,20 +751,18 @@ end
 -- On close of a SimpleUI-injected widget: restores the active tab and,
 -- when "Start with Homescreen" is set, re-opens the homescreen.
 -- Non-fullscreen widgets are passed straight through (fast path).
--- ReaderUI and other native KOReader widgets are never injected, so they
--- bypass both the tab-restore and homescreen re-open logic automatically.
 -- ---------------------------------------------------------------------------
 
 function M.patchUIManagerClose(plugin)
     local orig_close = UIManager.close
     plugin._orig_uimanager_close = orig_close
 
-    -- Defined once at patch-install time, not on every close() call.
-    -- Closes orphaned non-fullscreen widgets, then shows the homescreen.
+    -- Closes any orphaned non-fullscreen widgets, then shows the homescreen.
+    -- Defined once at patch-install time, not re-created on every close() call.
     local function _doShowHS(fm, plugin_ref)
         local HS = package.loaded["homescreen"]
         if not HS or HS._instance then return end
-        local stack = UI.getWindowStack()
+        local stack    = UI.getWindowStack()
         local to_close = {}
         for _i, entry in ipairs(stack) do
             local w = entry.widget
@@ -709,24 +775,24 @@ function M.patchUIManagerClose(plugin)
         Bottombar.setActiveAndRefreshFM(plugin_ref, "homescreen", tabs)
         if not plugin_ref._goalTapCallback then plugin_ref:addToMainMenu({}) end
         HS.show(
-            function(aid) plugin_ref:_onTabTap(aid, fm) end,
+            function(aid) plugin_ref:_navigate(aid, fm, tabs, false) end,
             plugin_ref._goalTapCallback
         )
     end
 
     UIManager.close = function(um_self, widget, ...)
         -- Fast path: non-fullscreen widgets (dialogs, menus, InfoMessage, etc.)
-        -- skip all SimpleUI logic — they are the vast majority of close() calls.
+        -- are the vast majority of close() calls — skip all SimpleUI logic.
         if not (widget and widget.covers_fullscreen) then
             return orig_close(um_self, widget, ...)
         end
 
-        -- Tab restore: only for SimpleUI-injected widgets not being closed
-        -- intentionally (e.g. by the user tapping a different tab).
+        -- Restore the active tab when a SimpleUI-injected widget closes normally
+        -- (not via intentional tab navigation).
         if widget._navbar_injected and not widget._navbar_closing_intentionally then
-            -- coll_list sits on top of the collections widget; restoreTabInFM
-            -- would skip it because another injected widget is still on the stack.
-            -- Find the prev_action saved on the underlying collections widget instead.
+            -- coll_list sits on top of collections; restoreTabInFM would skip it
+            -- because another injected widget is still on the stack. Find the
+            -- prev_action on the underlying collections widget instead.
             if widget.name == "coll_list" then
                 local FM2 = package.loaded["apps/filemanager/filemanager"]
                 local fm = FM2 and FM2.instance
@@ -757,36 +823,37 @@ function M.patchUIManagerClose(plugin)
 
         local result = orig_close(um_self, widget, ...)
 
-        -- Re-open homescreen after a SimpleUI-injected widget closes, when
-        -- "Start with Homescreen" is configured. Non-injected widgets (ReaderUI,
-        -- native KOReader pages) never have _navbar_injected so they skip this.
-        -- The homescreen itself is excluded: patchUIManagerShow closes it when
-        -- another fullscreen widget appears; that close must not re-open it.
-        if G_reader_settings:readSetting("start_with", "filemanager") == "homescreen_simpleui"
-                and widget._navbar_injected
+        -- Re-open the homescreen after any fullscreen widget closes when
+        -- "Start with Homescreen" is configured. Applies to both injected and
+        -- native widgets (ReaderProgress, CalendarView, etc.).
+        -- Exclusions: the homescreen itself (would loop) and widgets being
+        -- closed by intentional tab navigation.
+        if isStartWithHS()
+                and widget.covers_fullscreen
                 and widget.name ~= "homescreen"
                 and not widget._navbar_closing_intentionally then
             local FM2 = package.loaded["apps/filemanager/filemanager"]
             local fm  = FM2 and FM2.instance
             local other_open = false
-            local has_modal  = false
-            -- Single stack pass: detect a blocking fullscreen widget or a lingering modal.
             for _i, entry in ipairs(UI.getWindowStack()) do
                 local w = entry.widget
                 if w and w ~= fm and w ~= widget then
                     if w.covers_fullscreen then
                         other_open = true; break
-                    else
-                        has_modal = true
                     end
                 end
             end
-            if not other_open and fm then
-                if has_modal then
-                    -- Defer to let KOReader finish closing any modal widgets first.
-                    UIManager:scheduleIn(0, function() _doShowHS(fm, plugin) end)
+            if not other_open then
+                if widget.name == "ReaderUI" then
+                    -- Signal the next setupLayout to defer opening the HS until
+                    -- after the new FM instance is constructed, avoiding a flash.
+                    _hs_pending_after_reader = true
                 else
-                    _doShowHS(fm, plugin)
+                    UIManager:scheduleIn(0, function()
+                        local FM3 = package.loaded["apps/filemanager/filemanager"]
+                        local fm2 = FM3 and FM3.instance
+                        if fm2 then _doShowHS(fm2, plugin) end
+                    end)
                 end
             end
         end
@@ -797,8 +864,8 @@ end
 
 -- ---------------------------------------------------------------------------
 -- Menu.init
--- Removes the pagination bar from fullscreen FM-style menus when the
--- "navbar_pagination_visible" setting is off.
+-- Removes the pagination bar from fullscreen FM-style menus when
+-- "navbar_pagination_visible" is off.
 -- ---------------------------------------------------------------------------
 
 function M.patchMenuInitForPagination(plugin)
@@ -875,7 +942,7 @@ function M.teardownAll(plugin)
         UIManager.close = plugin._orig_uimanager_close
         plugin._orig_uimanager_close = nil
     end
-    -- Restore class patches via package.loaded (all modules already loaded; no pcall needed).
+    -- Restore class patches via package.loaded (modules already loaded; no pcall needed).
     local BookList = package.loaded["ui/widget/booklist"]
     if BookList and plugin._orig_booklist_new then
         BookList.new = plugin._orig_booklist_new; plugin._orig_booklist_new = nil
@@ -918,8 +985,10 @@ function M.teardownAll(plugin)
         FileManagerMenu._simpleui_startwith_orig    = nil
         FileManagerMenu._simpleui_startwith_patched = nil
     end
-    -- Reset module-level state so a re-enable starts clean.
-    _hs_boot_done = false
+    -- Reset all module-level state so a re-enable cycle starts clean.
+    _hs_boot_done            = false
+    _hs_pending_after_reader = false
+    _start_with_hs           = nil
     Config.reset()
     local Registry = package.loaded["desktop_modules/moduleregistry"]
     if Registry then Registry.invalidate() end
