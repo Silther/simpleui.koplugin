@@ -68,6 +68,7 @@ M.default_on  = true
 function M.reset() _SH = nil end
 
 function M.build(w, ctx)
+    Config.applyLabelToggle(M, _("Recent Books"))
     if not ctx.recent_fps or #ctx.recent_fps == 0 then return nil end
 
     local SH          = getSH()
@@ -259,6 +260,7 @@ function M.getMenuItems(ctx_menu)
         refresh   = refresh,
     })
     return {
+        Config.makeLabelToggleItem("recent", _("Recent Books"), refresh, _lc),
         _makeScaleItem(ctx_menu),
         label_item,
         _makeThumbScaleItem(ctx_menu),

@@ -307,6 +307,7 @@ function M.getCountLabel(_pfx)
 end
 
 function M.build(w, ctx)
+    Config.applyLabelToggle(M, _("Collections"))
     local scale       = Config.getModuleScale("collections", ctx.pfx)
     local thumb_scale = Config.getThumbScale("collections", ctx.pfx)
     local lbl_scale   = Config.getItemLabelScale("collections", ctx.pfx)
@@ -531,6 +532,7 @@ function M.getMenuItems(ctx_menu)
     end
 
     local items = {}
+    items[#items + 1] = Config.makeLabelToggleItem("collections", _("Collections"), refresh, _lc)
     items[#items + 1] = {
         text = _lc("Arrange Collections"), keep_menu_open = true,
         callback = function()

@@ -104,6 +104,7 @@ end
 -- ---------------------------------------------------------------------------
 
 function M.build(w, ctx)
+    Config.applyLabelToggle(M, _("New Books"))
     -- Cache the scan result for the lifetime of this render cycle.
     local new_fps = ctx._new_books_fps
     if not new_fps then
@@ -252,7 +253,7 @@ function M.getMenuItems(ctx_menu)
         set       = function(v) Config.setItemLabelScale(v, "new_books", ctx_menu.pfx) end,
         refresh   = ctx_menu.refresh,
     })
-    return { _makeScaleItem(ctx_menu), label_item, _makeThumbScaleItem(ctx_menu) }
+    return { Config.makeLabelToggleItem("new_books", _("New Books"), ctx_menu.refresh, ctx_menu._), _makeScaleItem(ctx_menu), label_item, _makeThumbScaleItem(ctx_menu) }
 end
 
 return M

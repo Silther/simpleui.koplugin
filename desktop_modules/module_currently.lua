@@ -332,6 +332,7 @@ function M.invalidateCache()
 end
 
 function M.build(w, ctx)
+    Config.applyLabelToggle(M, _("Currently Reading"))
     if not ctx.current_fp then return nil end
 
     local SH = getSH()
@@ -755,6 +756,7 @@ function M.getMenuItems(ctx_menu)
     }
 
     return {
+        Config.makeLabelToggleItem("currently", _("Currently Reading"), refresh, _lc),
         _makeScaleItem(ctx_menu),
         _makeTextScaleItem(ctx_menu),
         thumb,

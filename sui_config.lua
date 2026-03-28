@@ -1711,4 +1711,43 @@ function M.makeGapItem(opts)
     }
 end
 
+-- ---------------------------------------------------------------------------
+-- Per-module label (section title) visibility toggle.
+-- Setting key: "simpleui_hide_label_" .. mod_id  (true = hidden, nil = shown)
+-- Never stored as false — KOReader LuaSettings removes keys set to false.
+-- ---------------------------------------------------------------------------
+local function _labelHideKey(mod_id)
+    return "simpleui_hide_label_" .. (mod_id or "")
+end
+
+-- Returns true when the section label should be hidden.
+function M.isLabelHidden(mod_id)
+    return G_reader_settings:readSetting(_labelHideKey(mod_id)) == true
+end
+
+-- Call at the start of build() to keep mod.label in sync with the setting.
+function M.applyLabelToggle(mod, default_label)
+    if M.isLabelHidden(mod.id) then
+        mod.label = nil
+    else
+        mod.label = default_label
+    end
+end
+
+-- Returns a checkbox menu item for toggling the section label.
+-- _lc is the menu-local gettext wrapper (ctx_menu._).
+function M.makeLabelToggleItem(mod_id, default_label, refresh, _lc)
+    return {
+        text           = _lc("Show label"),
+        checked_func   = function() return not M.isLabelHidden(mod_id) end,
+        keep_menu_open = true,
+        callback       = function()
+            -- Store true to hide, nil (remove key) to show — never store false.
+            G_reader_settings:saveSetting(_labelHideKey(mod_id),
+                not M.isLabelHidden(mod_id) and true or nil)
+            refresh()
+        end,
+    }
+end
+
 return M
