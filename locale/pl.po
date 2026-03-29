@@ -1047,3 +1047,99 @@ msgstr "Szybkie Akcje %d"
 #: sui_bottombar.lua:1420
 msgid "Quit"
 msgstr "Wyjdź"
+
+#: desktop_modules/module_currently.lua:271
+msgid "Author"
+msgstr "Autor"
+
+#: desktop_modules/module_currently.lua:274
+msgid "Days of reading"
+msgstr "Dni czytania"
+
+#: desktop_modules/module_currently.lua:275
+msgid "Time read"
+msgstr "Czas czytania"
+
+#: desktop_modules/module_currently.lua:276
+msgid "Time remaining"
+msgstr "Pozostały czas"
+
+#: desktop_modules/module_currently.lua
+msgid "%s left"
+msgstr "Zostało %s"
+
+#: desktop_modules/module_currently.lua
+msgid "1 day"
+msgstr "1 dzień"
+
+#: desktop_modules/module_currently.lua
+msgid "%d days"
+msgstr "%d dni"
+
+#: desktop_modules/module_currently.lua
+msgid "Stats layout"
+msgstr "Układ statystyk"
+
+#: desktop_modules/module_reading_stats.lua:308
+msgid "Reading Stats"
+msgstr "Statystyki czytania"
+
+#: desktop_modules/module_reading_goals.lua:454
+#: desktop_modules/module_reading_goals.lua:455
+msgid "Reading Goals"
+msgstr "Cele czytania"
+
+#: sui_config.lua:121
+msgid "Stats"
+msgstr "Statystyki"
+
+#: desktop_modules/module_reading_stats.lua:68
+msgid "Streak"
+msgstr "Seria"
+
+#: desktop_modules/module_reading_goals.lua:491
+#: desktop_modules/module_reading_goals.lua:493
+#: desktop_modules/module_reading_goals.lua:515
+#: desktop_modules/module_reading_goals.lua:517
+msgid "Today"
+msgstr "Dzisiaj"
+
+#: desktop_modules/module_reading_stats.lua:63
+msgid "Today — Pages"
+msgstr "Dzisiaj — Strony"
+
+#: desktop_modules/module_reading_stats.lua:62
+msgid "Today — Time"
+msgstr "Dzisiaj — Czas"
+
+#: desktop_modules/module_reading_stats.lua:67
+msgid "books finished"
+msgstr "przeczytane książki"
+
+#: desktop_modules/module_reading_stats.lua:64
+msgid "daily avg (7 days)"
+msgstr "średnia dzienna (7 dni)"
+
+#: desktop_modules/module_reading_stats.lua:69
+msgid "day streak"
+msgstr "dzień z rzędu"
+
+#: desktop_modules/module_reading_stats.lua:69
+msgid "days streak"
+msgstr "dni z rzędu"
+
+#: desktop_modules/module_reading_stats.lua:62
+msgid "of reading today"
+msgstr "czytania dzisiaj"
+
+#: desktop_modules/module_reading_stats.lua:66
+msgid "of reading, all time"
+msgstr "czytania łącznie"
+
+#: desktop_modules/module_reading_stats.lua:63
+msgid "pages read today"
+msgstr "stron przeczytanych dzisiaj"
+
+#: desktop_modules/module_reading_stats.lua:65
+msgid "pages/day (7 days)"
+msgstr "stron/dzień (7 dni)"
