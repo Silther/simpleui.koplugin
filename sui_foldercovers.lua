@@ -68,6 +68,8 @@ local SK = {
     overlay_pages    = "simpleui_fc_overlay_pages",
     -- Item cache
     item_cache       = "simpleui_fc_item_cache",
+    -- Subfolder Cover
+    subfolder_cover  = "simpleui_fc_subfolder_cover",  
 }
 
 local M = {}
@@ -132,6 +134,10 @@ function M.setOverlayPages(v) _setFlag(SK.overlay_pages, v) end
 -- Item cache (default on)
 function M.getItemCache() return G_reader_settings:readSetting(SK.item_cache) ~= false end
 function M.setItemCache(v) _setFlag(SK.item_cache, v) end
+
+-- Subfolder Cover (default off)
+function M.getSubfolderCover() return G_reader_settings:isTrue(SK.subfolder_cover) end
+function M.setSubfolderCover(v) _setFlag(SK.subfolder_cover, v) end
 
 -- ---------------------------------------------------------------------------
 -- Cover file discovery — identical to original patch
@@ -279,10 +285,18 @@ end
 -- Returns nil when there is no count to display or the badge is hidden.
 local function _buildBadge(mandatory, cover_dimen, cv_scale)
     if M.getBadgeHidden() then return nil end
-    local nb_text = mandatory and mandatory:match("(%d+) \u{F016}") or ""
-    if nb_text == "" or nb_text == "0" then return nil end
 
-    local nb_count       = tonumber(nb_text)
+    local nb_text = mandatory and mandatory:match("(%d+) \u{F016}") or ""
+    local nb_count = tonumber(nb_text) or 0
+
+    -- If no files, try with subfolders
+    if nb_count == 0 then
+        local folder_text = mandatory and mandatory:match("(%d+) \u{F114}") or ""
+        local folder_count = tonumber(folder_text) or 0
+        if folder_count == 0 then return nil end
+        nb_count = folder_count
+    end
+
     local nb_size        = math.floor(_BASE_NB_SIZE * cv_scale)
     local nb_font_size   = math.floor(nb_size * (_BASE_NB_FS / _BASE_NB_SIZE))
     local badge_margin   = math.max(1, math.floor(_BADGE_MARGIN_BASE   * cv_scale))
@@ -679,8 +693,13 @@ function M.install()
         self.menu._dummy = false
         if not entries then return end
 
+        -- Check if the folder contains any files (or just subfolders).
+        local has_files = false
+        local has_subfolders = false
+	
         for _, entry in ipairs(entries) do
             if entry.is_file or entry.file then
+                has_files = true
                 local bookinfo = BookInfoManager:getBookInfo(entry.path, true)
                 if bookinfo
                     and bookinfo.cover_bb
@@ -690,8 +709,17 @@ function M.install()
                     and not BookInfoManager.isCachedCoverInvalid(bookinfo, self.menu.cover_specs)
                 then
                     self:_setFolderCover{ data = bookinfo.cover_bb, w = bookinfo.cover_w, h = bookinfo.cover_h }
-                    break
+                    return
                 end
+            else
+                has_subfolders = true
+            end
+        end
+
+        -- No book cover found: fall back to folder icon if only subfolders
+        if not has_files then
+            if M.getSubfolderCover() then
+                self:_setEmptyFolderCover()
             end
         end
     end
@@ -725,6 +753,94 @@ function M.install()
 
         local image        = ImageWidget:new(img_options)
         local size         = image:getSize()
+        local image_widget = FrameContainer:new{ padding = 0, bordersize = border, image }
+
+        local spine       = _buildSpine(size.h)
+        local cover_group = HorizontalGroup:new{ align = "center", spine, image_widget }
+
+        local cover_w     = _SPINE_W + size.w + border * 2
+        local cover_h     = size.h + border * 2
+        local cover_dimen = Geom:new{ w = cover_w, h = cover_h }
+        local cell_dimen  = Geom:new{ w = self.width, h = self.height }
+        local cv_scale    = cover_h / _BASE_COVER_H
+
+        local label_w            = size.w - _LATERAL_PAD * 2
+        local folder_name_widget = _buildLabel(self, label_w, size, border, cv_scale)
+        local nbitems_widget     = _buildBadge(self.mandatory, cover_dimen, cv_scale)
+
+        local overlap = OverlapGroup:new{ dimen = cover_dimen, cover_group }
+        if folder_name_widget then overlap[#overlap + 1] = folder_name_widget end
+        if nbitems_widget     then overlap[#overlap + 1] = nbitems_widget     end
+
+        -- Centre the cover in the cell, then shift left by half the spine
+        -- width so the visible image edge aligns with regular book covers.
+        local x_center = math.floor((self.width  - cover_w) / 2)
+        local y_center = math.floor((self.height - cover_h) / 2)
+        local spine_offset = -math.floor(_SPINE_W / 2)
+        overlap.overlap_offset = { x_center + spine_offset, y_center }
+        local widget = OverlapGroup:new{ dimen = cell_dimen, overlap }
+
+        if self._underline_container[1] then
+            self._underline_container[1]:free()
+        end
+        self._underline_container[1] = widget
+    end
+
+    -- Builds and displays a placeholder cover for folders that contain no direct ebooks
+    -- (only subfolders or empty folder). Since there are no book covers to show, it creates a white
+    -- blitbuffer, draws a folder icon in the center, adds the spine, the folder name
+    -- label, and the item-count badge, then positions the whole group in the cell.
+    function MosaicMenuItem:_setEmptyFolderCover()
+        -- Mark as processed to avoid re-processing.
+        self._foldercover_processed = true
+        local border    = Size.border.thin
+        local max_img_w = self.width  - _SPINE_W - border * 2
+        local max_img_h = self.height - border * 2
+
+        -- Create an empty (white) cover image with the target dimensions.
+        -- For "2_3" mode, force 2:3 aspect ratio; otherwise use available space.
+        local img_w, img_h
+        if M.getCoverMode() == "2_3" then
+            local ratio = 2 / 3
+            if max_img_w / max_img_h > ratio then
+                img_h = max_img_h
+                img_w = math.floor(max_img_h * ratio)
+            else
+                img_w = max_img_w
+                img_h = math.floor(max_img_w / ratio)
+            end
+        else
+            img_w = max_img_w
+            img_h = max_img_h
+        end
+
+        local _plugin_dir = debug.getinfo(1, "S").source:match("^@(.+/)[^/]+$") or "./"
+        local icon_path   = _plugin_dir .. "icons/custom.svg"
+        local icon_size   = math.floor(math.min(img_w, img_h) * 0.5)
+
+        local icon_widget
+        if lfs.attributes(icon_path, "mode") == "file" then
+            icon_widget = CenterContainer:new{
+            dimen = Geom:new{ w = img_w, h = img_h },
+            ImageWidget:new{
+                file   = icon_path,
+                width  = icon_size,
+                height = icon_size,
+                alpha  = true,
+                is_icon = true
+            },
+            }
+        end
+
+        local image = FrameContainer:new{
+            padding    = 0,
+            bordersize = 0,
+            background = Blitbuffer.COLOR_WHITE,
+            dimen      = Geom:new{ w = img_w, h = img_h },
+            icon_widget
+        }
+
+        local size         = Geom:new{ w = img_w, h = img_h }
         local image_widget = FrameContainer:new{ padding = 0, bordersize = border, image }
 
         local spine       = _buildSpine(size.h)
@@ -961,6 +1077,7 @@ function M.uninstall()
         MosaicMenuItem._simpleui_fc_stretched_iw = nil
     end
     MosaicMenuItem._setFolderCover      = nil
+    MosaicMenuItem._setEmptyFolderCover = nil
     MosaicMenuItem._getFolderNameWidget = nil
     MosaicMenuItem._simpleui_fc_patched = nil
     _uninstallItemCache()
