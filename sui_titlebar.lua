@@ -552,12 +552,19 @@ function M.apply(fm_self)
                         local current_path = fc_self.path or ""
                         local is_at_home_or_root = (current_path == "/" or _isLockedAtHome(current_path))
                         
+                        -- Virtual series folders keep the real parent's path, so
+                        -- _isLockedAtHome returns true even though we are one level
+                        -- "inside" a group. In that case the back button must still
+                        -- appear so the user can exit the virtual folder.
+                        local in_virtual_series = fc_self.item_table
+                            and fc_self.item_table._sg_is_series_view
+
                         -- Root/home always wins: if the path says we are home, the back
                         -- button must be hidden regardless of any stale _simpleui_has_go_up
                         -- flag left over from a previous subfolder visit.
-                        -- The virtual-series override only applies when we are NOT at root.
+                        -- Exception: virtual series folders whose parent IS the home folder.
                         local is_sub
-                        if is_at_home_or_root then
+                        if is_at_home_or_root and not in_virtual_series then
                             is_sub = false
                         else
                             -- In a real subfolder, or a virtual series folder (whose path
