@@ -19,10 +19,13 @@ local GestureRange     = require("ui/gesturerange")
 local HorizontalGroup  = require("ui/widget/horizontalgroup")
 local HorizontalSpan   = require("ui/widget/horizontalspan")
 local IconButton       = require("ui/widget/iconbutton")
+local IconWidget       = require("ui/widget/iconwidget")
 local ImageWidget      = require("ui/widget/imagewidget")
 local InputContainer   = require("ui/widget/container/inputcontainer")
 local LeftContainer    = require("ui/widget/container/leftcontainer")
 local LuaSettings      = require("luasettings")
+local OverlapGroup     = require("ui/widget/overlapgroup")
+local RightContainer   = require("ui/widget/container/rightcontainer")
 local Size             = require("ui/size")
 local TextBoxWidget    = require("ui/widget/textboxwidget")
 local TextWidget       = require("ui/widget/textwidget")
@@ -253,11 +256,39 @@ function BookCoverThumb:update()
         self.entry.cover_bb:free()
     end
 
-    -- Caption: title (+ "Downloaded" marker if present).
-    local caption_text = self.entry.book and self.entry.book.title or _("Untitled")
+    -- Downloaded indicator: small framed checkmark in the bottom-right
+    -- corner of the cover. We layer it on top via OverlapGroup so it
+    -- doesn't disturb the cover's aspect ratio.
     if self.entry.mandatory then
-        caption_text = caption_text .. "  · " .. self.entry.mandatory
+        local badge_pad   = Screen:scaleBySize(4)
+        local badge_size  = Screen:scaleBySize(22)
+        local badge_inner = badge_size - 2 * border
+        local badge = FrameContainer:new{
+            background    = Blitbuffer.COLOR_WHITE,
+            bordersize    = border,
+            margin        = 0,
+            padding       = 0,
+            radius        = math.floor(badge_size / 2),
+            IconWidget:new{
+                icon  = "check",
+                width = badge_inner,
+                height = badge_inner,
+            },
+        }
+        badge.overlap_offset = {
+            self.thumb_w - badge_size - badge_pad,
+            self.thumb_h - badge_size - badge_pad,
+        }
+        cover_widget = OverlapGroup:new{
+            dimen = Geom:new{ w = self.thumb_w, h = self.thumb_h },
+            allow_mirroring = false,
+            cover_widget,
+            badge,
+        }
     end
+
+    -- Caption: title only — the downloaded state is shown via the badge above.
+    local caption_text = self.entry.book and self.entry.book.title or _("Untitled")
     local caption = TextBoxWidget:new{
         text                          = caption_text,
         face                          = Font:getFace("cfont", 14),
@@ -305,14 +336,31 @@ function FolderRow:init()
         GestureRange:new{ ges = "tap", range = self.dimen },
     }
     local pad_h = Screen:scaleBySize(16)
-    self[1] = LeftContainer:new{
+    local chevron_size = Screen:scaleBySize(20)
+    self[1] = OverlapGroup:new{
         dimen = self.dimen:copy(),
-        HorizontalGroup:new{
-            HorizontalSpan:new{ width = pad_h },
-            TextWidget:new{
-                text = self.entry.text,
-                face = Font:getFace("cfont", 20),
-                bold = true,
+        allow_mirroring = false,
+        LeftContainer:new{
+            dimen = self.dimen:copy(),
+            HorizontalGroup:new{
+                HorizontalSpan:new{ width = pad_h },
+                TextWidget:new{
+                    text = self.entry.text,
+                    face = Font:getFace("cfont", 20),
+                    bold = true,
+                },
+            },
+        },
+        RightContainer:new{
+            dimen = self.dimen:copy(),
+            HorizontalGroup:new{
+                IconWidget:new{
+                    icon   = "chevron.right",
+                    width  = chevron_size,
+                    height = chevron_size,
+                    dim    = true,
+                },
+                HorizontalSpan:new{ width = pad_h },
             },
         },
     }
@@ -369,6 +417,10 @@ local function _buildFolderEntries()
         {
             text   = _("Favorites"),
             folder = { title = _("Favorites"),    filters = { list = "favorites" } },
+        },
+        {
+            text   = _("All Books"),
+            folder = { title = _("All Books"),    filters = {} },
         },
     }
 end
