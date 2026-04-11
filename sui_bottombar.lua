@@ -1372,6 +1372,14 @@ function M.navigate(plugin, action_id, fm_self, tabs, force)
         if fm.collections then fm.collections:onShowColl()
         else showUnavailable(_("Favorites not available.")) end
 
+    elseif action_id == "bookfusion" then
+        local ok_bf, BF = pcall(require, "sui_bookfusion")
+        if ok_bf and BF and type(BF.show) == "function" then
+            BF.show()
+        else
+            showUnavailable(_("BookFusion page not available."))
+        end
+
     elseif action_id == "bookmark_browser" then
         -- Show the source-selection ButtonDialog floating on top of whatever
         -- is currently visible. Delegates to the shared helper.

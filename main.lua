@@ -143,7 +143,7 @@ end
 local _PLUGIN_MODULES = {
     "sui_i18n", "sui_config", "sui_core", "sui_bottombar", "sui_topbar",
     "sui_patches", "sui_menu", "sui_titlebar", "sui_quickactions",
-    "sui_homescreen", "sui_foldercovers", "sui_updater",
+    "sui_homescreen", "sui_foldercovers", "sui_updater", "sui_bookfusion",
     "desktop_modules/moduleregistry",
     "desktop_modules/module_books_shared",
     "desktop_modules/module_clock",
