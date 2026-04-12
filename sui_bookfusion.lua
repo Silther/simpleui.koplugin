@@ -23,6 +23,7 @@ local IconWidget       = require("ui/widget/iconwidget")
 local ImageWidget      = require("ui/widget/imagewidget")
 local InputContainer   = require("ui/widget/container/inputcontainer")
 local LeftContainer    = require("ui/widget/container/leftcontainer")
+local LineWidget       = require("ui/widget/linewidget")
 local LuaSettings      = require("luasettings")
 local OverlapGroup     = require("ui/widget/overlapgroup")
 local RightContainer   = require("ui/widget/container/rightcontainer")
@@ -103,16 +104,49 @@ local function _cacheStore()
     return LuaSettings:open(CACHE_PATH)
 end
 
-local function _loadCachedBooks()
+-- Per-list cache: key = "books" (currently reading), "planned_to_read",
+-- "favorites".  All stored in the same LuaSettings file.
+local function _loadCachedList(key)
     local s = _cacheStore()
-    return s:readSetting("books")
+    return s:readSetting(key or "books")
 end
 
-local function _saveCachedBooks(books)
+local function _saveCachedList(key, books)
     local s = _cacheStore()
-    s:saveSetting("books", books or {})
+    s:saveSetting(key or "books", books or {})
     s:saveSetting("synced_at", os.time())
     s:flush()
+end
+
+-- Progress bar colours (matches SimpleUI home screen).
+local _CLR_BAR_BG = Blitbuffer.gray(0.15)
+local _CLR_BAR_FG = Blitbuffer.gray(0.75)
+
+-- Thin progress bar identical to the one on the SimpleUI home screen.
+-- w = bar width, pct = 0..1, bh = bar height in px.
+local function _progressBar(w, pct, bh)
+    bh = bh or Screen:scaleBySize(4)
+    local fw = math.max(0, math.floor(w * math.min(pct or 0, 1.0)))
+    if fw <= 0 then
+        return LineWidget:new{ dimen = Geom:new{ w = w, h = bh }, background = _CLR_BAR_BG }
+    end
+    return OverlapGroup:new{
+        dimen = Geom:new{ w = w, h = bh },
+        LineWidget:new{ dimen = Geom:new{ w = w,  h = bh }, background = _CLR_BAR_BG },
+        LineWidget:new{ dimen = Geom:new{ w = fw, h = bh }, background = _CLR_BAR_FG },
+    }
+end
+
+-- Reads percent_finished for a local file from DocSettings.
+local function _readLocalPercent(filepath)
+    local DocSettings = require("docsettings")
+    if DocSettings and filepath then
+        local ok, ds = pcall(DocSettings.open, DocSettings, filepath)
+        if ok and ds then
+            return ds:readSetting("percent_finished") or 0
+        end
+    end
+    return 0
 end
 
 -- Aspect-ratio-preserving scale factor (mirrors bf_listmenu).
@@ -169,18 +203,19 @@ end
 -- ---------------------------------------------------------------------------
 
 local BookCoverThumb = InputContainer:extend{
-    entry      = nil,   -- book entry from _buildBookEntries
-    menu       = nil,   -- parent menu (for onMenuSelect dispatch)
-    thumb_w    = 0,
-    thumb_h    = 0,
-    caption_h  = 0,
+    entry       = nil,   -- book entry from _buildBookEntries
+    menu        = nil,   -- parent menu (for onMenuSelect dispatch)
+    thumb_w     = 0,
+    thumb_h     = 0,
+    caption_h   = 0,
+    bar_total_h = 0,
 }
 
 function BookCoverThumb:init()
     self.dimen = Geom:new{
         x = 0, y = 0,
         w = self.thumb_w,
-        h = self.thumb_h + self.caption_h,
+        h = self.thumb_h + self.bar_total_h + self.caption_h,
     }
     self.ges_events.TapSelect = {
         GestureRange:new{ ges = "tap", range = self.dimen },
@@ -256,10 +291,10 @@ function BookCoverThumb:update()
         self.entry.cover_bb:free()
     end
 
-    -- Downloaded indicator: small framed checkmark in the bottom-right
-    -- corner of the cover. We layer it on top via OverlapGroup so it
-    -- doesn't disturb the cover's aspect ratio.
-    if self.entry.mandatory then
+    -- Not-downloaded indicator: small framed down-arrow in the bottom-right
+    -- corner of the cover. Shown only when the book has NOT been downloaded
+    -- yet, so the user knows which books still need fetching.
+    if not self.entry.mandatory then
         local badge_pad   = Screen:scaleBySize(4)
         local badge_size  = Screen:scaleBySize(22)
         local badge_inner = badge_size - 2 * border
@@ -270,7 +305,7 @@ function BookCoverThumb:update()
             padding       = 0,
             radius        = math.floor(badge_size / 2),
             IconWidget:new{
-                icon  = "check",
+                icon  = "move.down",
                 width = badge_inner,
                 height = badge_inner,
             },
@@ -299,15 +334,25 @@ function BookCoverThumb:update()
         alignment                     = "center",
     }
 
-    self[1] = CenterContainer:new{
-        dimen = self.dimen:copy(),
-        VerticalGroup:new{
-            align = "center",
-            cover_widget,
-            VerticalSpan:new{ width = Screen:scaleBySize(4) },
-            caption,
-        },
-    }
+    -- Use VerticalGroup directly (no CenterContainer) so covers are
+    -- pinned to the top of the cell. Horizontal centering is already
+    -- handled inside cover_widget and by caption's alignment="center".
+    local vg_children = VerticalGroup:new{ align = "center" }
+    table.insert(vg_children, cover_widget)
+
+    -- Progress bar only when bar_total_h > 0 (currently-reading strip).
+    if self.bar_total_h > 0 then
+        local bar_gap = Screen:scaleBySize(4)
+        local bar_h   = Screen:scaleBySize(5)
+        table.insert(vg_children, VerticalSpan:new{ width = bar_gap })
+        table.insert(vg_children, _progressBar(self.thumb_w, self.entry.percent or 0, bar_h))
+        table.insert(vg_children, VerticalSpan:new{ width = bar_gap })
+    else
+        table.insert(vg_children, VerticalSpan:new{ width = Screen:scaleBySize(4) })
+    end
+
+    table.insert(vg_children, caption)
+    self[1] = vg_children
     self.refresh_dimen = self.dimen
 end
 
@@ -374,6 +419,86 @@ function FolderRow:onTapSelect()
 end
 
 -- ---------------------------------------------------------------------------
+-- Back-navigation row (used in inline folder views)
+-- ---------------------------------------------------------------------------
+
+local BackRow = InputContainer:extend{
+    text   = "",
+    menu   = nil,
+    width  = 0,
+    height = 0,
+}
+
+function BackRow:init()
+    self.dimen = Geom:new{ x = 0, y = 0, w = self.width, h = self.height }
+    self.ges_events.TapSelect = {
+        GestureRange:new{ ges = "tap", range = self.dimen },
+    }
+    local pad_h = Screen:scaleBySize(16)
+    local chevron_size = Screen:scaleBySize(20)
+    self[1] = LeftContainer:new{
+        dimen = self.dimen:copy(),
+        HorizontalGroup:new{
+            HorizontalSpan:new{ width = pad_h },
+            IconWidget:new{
+                icon   = "chevron.left",
+                width  = chevron_size,
+                height = chevron_size,
+            },
+            HorizontalSpan:new{ width = Screen:scaleBySize(4) },
+            TextWidget:new{
+                text = self.text,
+                face = Font:getFace("cfont", 20),
+                bold = true,
+            },
+        },
+    }
+end
+
+function BackRow:onTapSelect()
+    if self.menu then
+        self.menu._view = "home"
+        self.menu._folder_grid_page = 1
+        self.menu:updateItems()
+    end
+    return true
+end
+
+-- ---------------------------------------------------------------------------
+-- "Load more" row (used in inline folder views)
+-- ---------------------------------------------------------------------------
+
+local LoadMoreRow = InputContainer:extend{
+    text   = "",
+    menu   = nil,
+    width  = 0,
+    height = 0,
+}
+
+function LoadMoreRow:init()
+    self.dimen = Geom:new{ x = 0, y = 0, w = self.width, h = self.height }
+    self.ges_events.TapSelect = {
+        GestureRange:new{ ges = "tap", range = self.dimen },
+    }
+    local pad_h = Screen:scaleBySize(16)
+    self[1] = CenterContainer:new{
+        dimen = self.dimen:copy(),
+        TextWidget:new{
+            text = self.text,
+            face = Font:getFace("cfont", 18),
+            bold = true,
+        },
+    }
+end
+
+function LoadMoreRow:onTapSelect()
+    if self.menu and self.menu._loadMoreFolderBooks then
+        self.menu._loadMoreFolderBooks()
+    end
+    return true
+end
+
+-- ---------------------------------------------------------------------------
 -- Item-table builder
 -- Returns { books = {...}, folders = {...} }. The book array drives the
 -- horizontal cover strip; the folder array drives the bottom rows.
@@ -381,7 +506,9 @@ end
 -- the menu as item_table so Menu:init / FocusManager don't choke on emptiness.
 -- ---------------------------------------------------------------------------
 
-local function _buildBookEntries(bf, settings, books)
+-- with_progress: when true, reads local DocSettings / cloud_percent for
+-- the progress bar.  Pass false for folder views that don't show bars.
+local function _buildBookEntries(bf, settings, books, with_progress)
     if books == nil then return nil end
     local out = {}
     local Downloader   = bf.downloader
@@ -402,6 +529,11 @@ local function _buildBookEntries(bf, settings, books)
         }
         if Downloader.fileExists(filepath) then
             entry.mandatory = _("Downloaded")
+            if with_progress then
+                entry.percent = _readLocalPercent(filepath)
+            end
+        elseif with_progress then
+            entry.percent = book.cloud_percent or 0
         end
         out[#out + 1] = entry
     end
@@ -412,15 +544,20 @@ local function _buildFolderEntries()
     return {
         {
             text   = _("Plan to Read"),
-            folder = { title = _("Plan to Read"), filters = { list = "planned_to_read" } },
+            folder = { title = _("Plan to Read"), filters = { list = "planned_to_read" }, cache_key = "planned_to_read" },
         },
         {
             text   = _("Favorites"),
-            folder = { title = _("Favorites"),    filters = { list = "favorites" } },
+            folder = { title = _("Favorites"),    filters = { list = "favorites" }, cache_key = "favorites" },
         },
         {
             text   = _("All Books"),
             folder = { title = _("All Books"),    filters = {} },
+            -- no cache_key → always fetched from cloud
+        },
+        {
+            text   = _("Browse BookFusion"),
+            browse = true,
         },
     }
 end
@@ -475,6 +612,204 @@ local function _placeholderRow(text, content_w)
 end
 
 -- ---------------------------------------------------------------------------
+-- Inline folder view (cover grid)
+-- Renders a paginated cover grid for a single bookshelf / filter view.
+-- ---------------------------------------------------------------------------
+
+local function _buildFolderViewUI(self)
+    local content_w = self.inner_dimen.w
+    local content_h = self.available_height
+    local vg = VerticalGroup:new{ align = "left" }
+
+    -- ── Back row ──
+    local back_h = Screen:scaleBySize(48)
+    local back_row = BackRow:new{
+        text   = self._folder_title or _("Back"),
+        menu   = self,
+        width  = content_w,
+        height = back_h,
+    }
+    table.insert(vg, back_row)
+    table.insert(self.layout, { back_row })
+
+    local books = self._folder_books
+
+    -- Helper: wrap vg in a full-height white background so switching
+    -- between home ↔ folder doesn't leave stale pixels at the bottom.
+    -- Uses OverlapGroup because its getSize() respects the fixed dimen,
+    -- ensuring the parent allocates the full height (unlike FrameContainer
+    -- whose getSize() is always content-based).
+    local function _commitVG()
+        local bg = LineWidget:new{
+            dimen      = Geom:new{ w = content_w, h = content_h },
+            background = Blitbuffer.COLOR_WHITE,
+        }
+        table.insert(self.item_group, OverlapGroup:new{
+            dimen           = Geom:new{ w = content_w, h = content_h },
+            allow_mirroring = false,
+            bg,
+            vg,
+        })
+    end
+
+    if books == nil then
+        table.insert(vg, _placeholderRow(_("Loading…"), content_w))
+        _commitVG()
+        return
+    end
+
+    if #books == 0 then
+        table.insert(vg, _placeholderRow(_("No books found."), content_w))
+        _commitVG()
+        return
+    end
+
+    -- ── Grid layout constants ──
+    local caption_h   = Screen:scaleBySize(36)
+    local bar_total_h = 0  -- no progress bar in folder views
+    local cell_pad    = Screen:scaleBySize(10)
+    local grid_pad_h  = Screen:scaleBySize(12)
+    local grid_w      = content_w - 2 * grid_pad_h
+
+    -- Cover sizing: guarantee at least 4 per row.
+    local MIN_PER_ROW = 4
+    local max_thumb_w = math.floor((grid_w - (MIN_PER_ROW - 1) * cell_pad) / MIN_PER_ROW)
+    local cap_thumb_w = Screen:scaleBySize(180)
+    local thumb_w     = math.min(max_thumb_w, cap_thumb_w)
+    if thumb_w < Screen:scaleBySize(80) then thumb_w = Screen:scaleBySize(80) end
+    local thumb_h     = math.floor(thumb_w * 3 / 2)
+
+    local cols         = math.max(1, math.floor((grid_w + cell_pad) / (thumb_w + cell_pad)))
+    local cell_total_h = thumb_h + bar_total_h + caption_h
+
+    -- How many rows fit in the remaining height (leave room for page nav)?
+    local nav_h       = Screen:scaleBySize(40)
+    local remaining_h = content_h - back_h - nav_h - Screen:scaleBySize(8)
+    local rows        = math.max(1, math.floor((remaining_h + cell_pad) / (cell_total_h + cell_pad)))
+
+    local per_page    = cols * rows
+    local n           = #books
+    local total_pages = math.max(1, math.ceil(n / per_page))
+    local page        = self._folder_grid_page or 1
+    if page < 1 then page = 1 end
+    if page > total_pages then page = total_pages end
+    self._folder_grid_page  = page
+    self._folder_grid_pages = total_pages
+
+    local first_idx = (page - 1) * per_page + 1
+    local last_idx  = math.min(first_idx + per_page - 1, n)
+
+    table.insert(vg, VerticalSpan:new{ width = Screen:scaleBySize(4) })
+
+    -- ── Build rows of covers ──
+    local idx = first_idx
+    for r = 1, rows do
+        if idx > last_idx then break end
+        local row_hg = HorizontalGroup:new{ align = "top" }
+        table.insert(row_hg, HorizontalSpan:new{ width = grid_pad_h })
+        local row_layout = {}
+        for c = 1, cols do
+            if idx > last_idx then break end
+            local entry = books[idx]
+            _hydrateEntryCover(entry)
+            local thumb = BookCoverThumb:new{
+                entry       = entry,
+                menu        = self,
+                thumb_w     = thumb_w,
+                thumb_h     = thumb_h,
+                caption_h   = caption_h,
+                bar_total_h = bar_total_h,
+                show_parent = self.show_parent,
+            }
+            table.insert(row_hg, thumb)
+            table.insert(row_layout, thumb)
+            if entry.lazy_load_cover or (entry.cover_url and not entry.has_cover) then
+                table.insert(self.items_to_update, thumb)
+            end
+            if c < cols and idx < last_idx then
+                table.insert(row_hg, HorizontalSpan:new{ width = cell_pad })
+            end
+            idx = idx + 1
+        end
+        table.insert(vg, row_hg)
+        table.insert(self.layout, row_layout)
+        if r < rows and idx <= last_idx then
+            table.insert(vg, VerticalSpan:new{ width = cell_pad })
+        end
+    end
+
+    -- ── Bottom navigation ──
+    local nav_hg = HorizontalGroup:new{ align = "center" }
+    local arrow_size = Screen:scaleBySize(40)
+
+    local has_more_api = self._folder_total and n < self._folder_total
+
+    local function _nav_arrow(icon_name, enabled, on_tap)
+        if enabled then
+            return IconButton:new{
+                icon        = icon_name,
+                width       = arrow_size,
+                height      = arrow_size,
+                padding     = Screen:scaleBySize(4),
+                callback    = on_tap,
+                show_parent = self.show_parent,
+            }
+        end
+        return HorizontalSpan:new{ width = arrow_size }
+    end
+
+    local left_arrow = _nav_arrow("chevron.left", page > 1, function()
+        self._folder_grid_page = (self._folder_grid_page or 1) - 1
+        self:updateItems()
+    end)
+
+    -- On the last grid page with more API books, right arrow loads more
+    -- instead of advancing the grid page.
+    local right_enabled = page < total_pages or has_more_api
+    local right_arrow = _nav_arrow("chevron.right", right_enabled, function()
+        if page < total_pages then
+            self._folder_grid_page = (self._folder_grid_page or 1) + 1
+            self:updateItems()
+        elseif has_more_api and self._loadMoreFolderBooks then
+            self._loadMoreFolderBooks()
+        end
+    end)
+
+    -- Page label: "X / Y" or "X / Y+" when more API pages exist.
+    local page_text = string.format("%d / %d", page, total_pages)
+    if has_more_api then
+        page_text = page_text .. "+"
+    end
+    local page_label = TextWidget:new{
+        text    = page_text,
+        face    = Font:getFace("cfont", 14),
+        fgcolor = Blitbuffer.COLOR_DARK_GRAY,
+    }
+
+    table.insert(nav_hg, HorizontalSpan:new{ width = grid_pad_h })
+    table.insert(nav_hg, left_arrow)
+    table.insert(nav_hg, HorizontalSpan:new{ width = cell_pad })
+    table.insert(nav_hg, CenterContainer:new{
+        dimen = Geom:new{
+            w = grid_w - 2 * (arrow_size + cell_pad),
+            h = arrow_size,
+        },
+        page_label,
+    })
+    table.insert(nav_hg, HorizontalSpan:new{ width = cell_pad })
+    table.insert(nav_hg, right_arrow)
+    table.insert(nav_hg, HorizontalSpan:new{ width = grid_pad_h })
+
+    if total_pages > 1 or has_more_api then
+        table.insert(vg, VerticalSpan:new{ width = Screen:scaleBySize(4) })
+        table.insert(vg, nav_hg)
+        table.insert(self.layout, { left_arrow, right_arrow })
+    end
+
+    _commitVG()
+end
+
+-- ---------------------------------------------------------------------------
 -- Menu method overrides
 -- ---------------------------------------------------------------------------
 
@@ -502,6 +837,11 @@ end
 -- folder rows directly into self.item_group. Populates self.layout for focus
 -- management and self.items_to_update for the lazy cover loader.
 local function _updateItemsBuildUI(self)
+    -- Delegate to the folder view when a bookshelf is open.
+    if self._view == "folder" then
+        return _buildFolderViewUI(self)
+    end
+
     local content_w = self.inner_dimen.w
     local content_h = self.available_height
 
@@ -522,16 +862,14 @@ local function _updateItemsBuildUI(self)
         -- there's only one page so the strip stays centered and doesn't
         -- visually shift between pages.
         local caption_h     = Screen:scaleBySize(44)
+        local bar_total_h   = Screen:scaleBySize(4 + 5 + 4)  -- gap + bar + gap
         local strip_pad_h   = Screen:scaleBySize(16)
         local cell_pad      = Screen:scaleBySize(16)
         local arrow_size    = Screen:scaleBySize(48)
         local strip_inner_w = content_w - 2 * (strip_pad_h + arrow_size + cell_pad)
-        local strip_max_h   = math.floor(content_h * 0.72) - caption_h - Screen:scaleBySize(12)
+        local strip_max_h   = math.floor(content_h * 0.72) - caption_h - bar_total_h - Screen:scaleBySize(12)
 
-        -- Cover sizing: guarantee that at least MIN_PER_PAGE thumbs fit
-        -- horizontally (caller asked for "at least 3 per row"), then enlarge
-        -- if there's vertical room. Cap to a maximum so single-book strips
-        -- don't get an absurd cover on a tall screen.
+        -- Cover sizing: guarantee at least 3 thumbs per page.
         local MIN_PER_PAGE   = 3
         local max_thumb_w    = math.floor((strip_inner_w - (MIN_PER_PAGE - 1) * cell_pad) / MIN_PER_PAGE)
         local thumb_w_from_h = math.floor(strip_max_h * 2 / 3)
@@ -560,9 +898,15 @@ local function _updateItemsBuildUI(self)
         local last_idx    = math.min(first_idx + per_page - 1, n)
         local visible_n   = last_idx - first_idx + 1
 
-        -- Centre the visible thumbs in the strip's available width.
+        -- Full pages are centred; partial last pages are left-aligned
+        -- so 1–2 books don't float awkwardly in the middle of the strip.
         local thumbs_used_w = visible_n * thumb_w + (visible_n - 1) * cell_pad
-        local lead_pad      = math.max(0, math.floor((strip_inner_w - thumbs_used_w) / 2))
+        local lead_pad
+        if visible_n >= per_page then
+            lead_pad = math.max(0, math.floor((strip_inner_w - thumbs_used_w) / 2))
+        else
+            lead_pad = 0
+        end
 
         local thumbs_hg = HorizontalGroup:new{ align = "top" }
         if lead_pad > 0 then
@@ -577,6 +921,7 @@ local function _updateItemsBuildUI(self)
                 thumb_w     = thumb_w,
                 thumb_h     = thumb_h,
                 caption_h   = caption_h,
+                bar_total_h = bar_total_h,
                 show_parent = self.show_parent,
             }
             table.insert(thumbs_hg, thumb)
@@ -622,8 +967,8 @@ local function _updateItemsBuildUI(self)
                 left_arrow,
             },
             HorizontalSpan:new{ width = cell_pad },
-            CenterContainer:new{
-                dimen = Geom:new{ w = strip_inner_w, h = thumb_h + caption_h },
+            LeftContainer:new{
+                dimen = Geom:new{ w = strip_inner_w, h = thumb_h + bar_total_h + caption_h },
                 thumbs_hg,
             },
             HorizontalSpan:new{ width = cell_pad },
@@ -672,7 +1017,18 @@ local function _updateItemsBuildUI(self)
         table.insert(self.layout, { row })
     end
 
-    table.insert(self.item_group, vg)
+    -- Wrap in a full-height white background so switching between
+    -- home ↔ folder doesn't leave stale pixels at the bottom.
+    local bg = LineWidget:new{
+        dimen      = Geom:new{ w = content_w, h = content_h },
+        background = Blitbuffer.COLOR_WHITE,
+    }
+    table.insert(self.item_group, OverlapGroup:new{
+        dimen           = Geom:new{ w = content_w, h = content_h },
+        allow_mirroring = false,
+        bg,
+        vg,
+    })
 end
 
 -- Drops the page_info BottomContainer from the menu's outer OverlapGroup so
@@ -725,20 +1081,64 @@ function M.show()
     local menu
     local syncing = false  -- guards against re-entrant sync taps
 
-    local function open_folder(folder)
+    -- Opens a bookshelf inline as a cover grid within the SimpleUI page.
+    -- Cached folders (Plan to Read, Favorites) load from disk instantly;
+    -- uncached folders (All Books) always fetch from the cloud.
+    local function openFolderInline(folder)
         if not folder then return end
-        if menu then
-            menu._navbar_closing_intentionally = true
-            UIManager:close(menu)
+        menu._view              = "folder"
+        menu._folder_title      = folder.title
+        menu._folder_filters    = folder.filters
+        menu._folder_cache_key  = folder.cache_key
+        menu._folder_grid_page  = 1
+
+        -- Try disk cache for cached folders.
+        if folder.cache_key then
+            local cached = _loadCachedList(folder.cache_key)
+            if cached then
+                menu._folder_raw_books = cached
+                menu._folder_books     = _buildBookEntries(bf, settings, cached, false)
+                menu._folder_api_page  = 1
+                menu._folder_total     = #cached
+                menu:updateItems()
+                return
+            end
         end
-        local nbrowser = bf.browser:new(api, settings)
-        nbrowser:show()
-        nbrowser:openBookList(folder.title, folder.filters)
+
+        -- No cache or cloud-only: fetch from API.
+        menu._folder_books      = nil   -- nil = "Loading…"
+        menu._folder_raw_books  = {}
+        menu._folder_api_page   = 0
+        menu._folder_total      = nil
+        menu:updateItems()
+        menu._fetchFolderPage()
     end
 
-    -- Pulls fresh currently-reading data from the API, writes it to cache,
-    -- and re-renders the strip. Shows a transient "Syncing…" InfoMessage so
-    -- the user gets feedback while the network round-trip is in flight.
+    -- Fetches a single book list from the API and saves it to the disk cache.
+    -- Returns the raw data array, or nil on failure.
+    local function syncList(list_filter, cache_key, fetch_progress)
+        local params = { page = 1, per_page = 50 }
+        if list_filter then
+            params.list = list_filter
+            params.sort = "last_read_at-desc"
+        end
+        local ok, data = api:searchBooks(params)
+        if not ok then return nil end
+        data = data or {}
+        if fetch_progress then
+            for _, book in ipairs(data) do
+                if book.id then
+                    local p_ok, pos = api:getReadingPosition(book.id)
+                    if p_ok and pos and pos.percentage then
+                        book.cloud_percent = pos.percentage / 100
+                    end
+                end
+            end
+        end
+        _saveCachedList(cache_key, data)
+        return data
+    end
+
     local function doSync()
         if syncing then return end
         syncing = true
@@ -748,22 +1148,33 @@ function M.show()
         UIManager:show(notice)
         UIManager:scheduleIn(0.05, function()
             NetworkMgr:runWhenOnline(function()
-                local ok, data = api:searchBooks{
-                    list     = "currently_reading",
-                    sort     = "last_read_at-desc",
-                    page     = 1,
-                    per_page = 20,
-                }
+                -- Sync all cached lists.
+                local cr_data = syncList("currently_reading", "books", true)
+                syncList("planned_to_read", "planned_to_read", false)
+                syncList("favorites", "favorites", false)
+
                 UIManager:close(notice)
                 syncing = false
-                if not ok then
+
+                if cr_data == nil then
                     _showInfo(_("Sync failed."))
                     return
                 end
-                _saveCachedBooks(data or {})
+
                 if M._instance == menu then
-                    menu._books      = _buildBookEntries(bf, settings, data or {})
+                    menu._books      = _buildBookEntries(bf, settings, cr_data, true)
                     menu._strip_page = 1
+
+                    -- If the user is viewing a cached folder, refresh it too.
+                    if menu._view == "folder" and menu._folder_cache_key then
+                        local fresh = _loadCachedList(menu._folder_cache_key)
+                        if fresh then
+                            menu._folder_raw_books = fresh
+                            menu._folder_books     = _buildBookEntries(bf, settings, fresh, false)
+                            menu._folder_total     = #fresh
+                        end
+                    end
+
                     menu:updateItems()
                 end
             end)
@@ -780,6 +1191,67 @@ function M.show()
         nbrowser:showBookSearchDialog()
     end
 
+    -- Fetches the next page of books from the API for the current folder
+    -- view, appends them to menu._folder_raw_books, rebuilds entries, and
+    -- refreshes the grid.
+    local function fetchFolderPage()
+        local NetworkMgr = require("ui/network/manager")
+        NetworkMgr:runWhenOnline(function()
+            UIManager:scheduleIn(0.05, function()
+                local params = {
+                    page     = (menu._folder_api_page or 0) + 1,
+                    per_page = 20,
+                }
+                for k, v in pairs(menu._folder_filters or {}) do
+                    params[k] = v
+                end
+                if not params.sort then params.sort = "added_at-desc" end
+
+                local ok, data, pagination = api:searchBooks(params)
+                if not ok then
+                    _showInfo(_("Failed to load books."))
+                    if menu._folder_books == nil then
+                        menu._folder_books = {}
+                        if M._instance == menu then menu:updateItems() end
+                    end
+                    return
+                end
+
+                if pagination then
+                    menu._folder_api_page = pagination.page or ((menu._folder_api_page or 0) + 1)
+                    menu._folder_total    = pagination.total
+                else
+                    menu._folder_api_page = (menu._folder_api_page or 0) + 1
+                end
+
+                for _, book in ipairs(data or {}) do
+                    table.insert(menu._folder_raw_books, book)
+                end
+
+                menu._folder_books = _buildBookEntries(bf, settings, menu._folder_raw_books, false)
+                -- When triggered by "load more", advance grid to the page
+                -- containing the first newly loaded book.
+                if menu._folder_advance_on_load then
+                    local old_n = menu._folder_advance_on_load
+                    menu._folder_advance_on_load = nil
+                    local new_n = #menu._folder_books
+                    if new_n > old_n then
+                        -- Estimate per_page from current grid_pages to advance.
+                        local cur_pages = menu._folder_grid_pages or 1
+                        local per_page = (cur_pages > 0 and old_n > 0) and math.ceil(old_n / cur_pages) or 9
+                        menu._folder_grid_page = math.floor(old_n / per_page) + 1
+                    end
+                end
+                if M._instance == menu and menu._view == "folder" then
+                    menu:updateItems()
+                end
+            end)
+        end)
+    end
+
+    -- Attach to menu so _buildFolderViewUI / LoadMoreRow can call it.
+    -- menu is assigned below, but the closure captures the local.
+
     -- Build a custom title bar so we can put a refresh icon on the right
     -- (Menu's default close_callback would otherwise commandeer right_icon
     -- with a "close" button — see TitleBar:init line 87). The bottom navbar
@@ -791,8 +1263,11 @@ function M.show()
         title                   = _("BookFusion"),
         left_icon               = "appbar.search",
         left_icon_tap_callback  = doSearch,
+        left_icon_size_ratio    = 0.8,
         right_icon              = "cre.render.reload",
         right_icon_tap_callback = doSync,
+        right_icon_size_ratio   = 0.8,
+        button_padding          = Screen:scaleBySize(15),
     }
 
     menu = PageMenu:new{
@@ -812,7 +1287,14 @@ function M.show()
                 if item.book then
                     browser:onSelectBook(item.book)
                 elseif item.folder then
-                    open_folder(item.folder)
+                    openFolderInline(item.folder)
+                elseif item.browse then
+                    if menu then
+                        menu._navbar_closing_intentionally = true
+                        UIManager:close(menu)
+                    end
+                    local nbrowser = bf.browser:new(api, settings)
+                    nbrowser:show()
                 end
             end)
             if not ok then
@@ -828,8 +1310,8 @@ function M.show()
     -- Initial state: try the disk cache first; only auto-fetch if there is
     -- no cache yet (so first-time users still see content without having to
     -- tap sync). Folder shortcuts are always available.
-    local cached_books = _loadCachedBooks()
-    menu._books      = cached_books and _buildBookEntries(bf, settings, cached_books) or nil
+    local cached_books = _loadCachedList("books")
+    menu._books      = cached_books and _buildBookEntries(bf, settings, cached_books, true) or nil
     menu._folders    = _buildFolderEntries()
     menu._strip_page = 1
 
@@ -847,6 +1329,21 @@ function M.show()
     menu._recalculateDimen   = _recalculateDimen
     menu._updateItemsBuildUI = _updateItemsBuildUI
     menu._do_cover_images    = true
+
+    -- Inline folder view helpers (closures need menu reference).
+    menu._fetchFolderPage = fetchFolderPage
+    menu._loadMoreFolderBooks = function()
+        -- Jump to the last grid page + 1 after loading (new books appear at end).
+        local old_n = menu._folder_books and #menu._folder_books or 0
+        local grid_page_before = menu._folder_grid_page or 1
+        fetchFolderPage()
+        -- After fetchFolderPage completes async, updateItems will be called.
+        -- We want the grid to advance past the old last page. We schedule a
+        -- follow-up that adjusts the grid page once the new data arrives,
+        -- but fetchFolderPage already calls updateItems. To ensure we land
+        -- on the new page, we set a flag that _buildFolderViewUI checks.
+        menu._folder_advance_on_load = old_n
+    end
 
     -- No pagination footer: drop it from the outer OverlapGroup and stub
     -- updatePageInfo so subsequent updateItems calls don't try to repaint it.
