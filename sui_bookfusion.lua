@@ -551,11 +551,6 @@ local function _buildFolderEntries()
             folder = { title = _("Favorites"),    filters = { list = "favorites" }, cache_key = "favorites" },
         },
         {
-            text   = _("All Books"),
-            folder = { title = _("All Books"),    filters = {} },
-            -- no cache_key → always fetched from cloud
-        },
-        {
             text   = _("Browse BookFusion"),
             browse = true,
         },
@@ -1090,6 +1085,7 @@ function M.show()
         menu._folder_title      = folder.title
         menu._folder_filters    = folder.filters
         menu._folder_cache_key  = folder.cache_key
+        menu._folder_query      = folder.query   -- nil unless search
         menu._folder_grid_page  = 1
 
         -- Try disk cache for cached folders.
@@ -1182,13 +1178,40 @@ function M.show()
     end
 
     local function doSearch()
-        if menu then
-            menu._navbar_closing_intentionally = true
-            UIManager:close(menu)
-        end
-        local nbrowser = bf.browser:new(api, settings)
-        nbrowser:show()
-        nbrowser:showBookSearchDialog()
+        local InputDialog = require("ui/widget/inputdialog")
+        local dialog
+        dialog = InputDialog:new{
+            title = _("Search books"),
+            input = "",
+            buttons = {
+                {
+                    {
+                        text     = _("Cancel"),
+                        id       = "close",
+                        callback = function()
+                            UIManager:close(dialog)
+                        end,
+                    },
+                    {
+                        text     = _("Search"),
+                        is_enter_default = true,
+                        callback = function()
+                            local query = dialog:getInputText()
+                            UIManager:close(dialog)
+                            if query and query ~= "" then
+                                openFolderInline({
+                                    title   = _("Search: ") .. query,
+                                    filters = {},
+                                    query   = query,
+                                })
+                            end
+                        end,
+                    },
+                },
+            },
+        }
+        UIManager:show(dialog)
+        dialog:onShowKeyboard()
     end
 
     -- Fetches the next page of books from the API for the current folder
@@ -1204,6 +1227,9 @@ function M.show()
                 }
                 for k, v in pairs(menu._folder_filters or {}) do
                     params[k] = v
+                end
+                if menu._folder_query and menu._folder_query ~= "" then
+                    params.query = menu._folder_query
                 end
                 if not params.sort then params.sort = "added_at-desc" end
 
@@ -1269,6 +1295,15 @@ function M.show()
         right_icon_size_ratio   = 0.8,
         button_padding          = Screen:scaleBySize(15),
     }
+    -- Reduce the bottom hitbox so it doesn't overlap the back row in
+    -- folder views, making it hard to tap "← Back".
+    local btn_bottom_pad = Screen:scaleBySize(6)
+    if title_bar.left_button then
+        title_bar.left_button.padding_bottom = btn_bottom_pad
+    end
+    if title_bar.right_button then
+        title_bar.right_button.padding_bottom = btn_bottom_pad
+    end
 
     menu = PageMenu:new{
         name              = "bookfusion",
