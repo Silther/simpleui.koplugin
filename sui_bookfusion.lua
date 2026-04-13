@@ -506,6 +506,31 @@ end
 -- the menu as item_table so Menu:init / FocusManager don't choke on emptiness.
 -- ---------------------------------------------------------------------------
 
+-- Re-check file existence on all entries so the download badge stays
+-- accurate after a book is downloaded or removed from the device.
+local function _refreshDownloadStatus(entries, bf, settings, with_progress)
+    if not entries then return end
+    local Downloader   = bf.downloader
+    local download_dir = Downloader.getDownloadDir(settings)
+    for _, entry in ipairs(entries) do
+        if entry.book then
+            local filename = Downloader.buildFilename(entry.book)
+            local filepath = download_dir .. "/" .. filename
+            if Downloader.fileExists(filepath) then
+                entry.mandatory = _("Downloaded")
+                if with_progress then
+                    entry.percent = _readLocalPercent(filepath)
+                end
+            else
+                entry.mandatory = nil
+                if with_progress then
+                    entry.percent = entry.book.cloud_percent or 0
+                end
+            end
+        end
+    end
+end
+
 -- with_progress: when true, reads local DocSettings / cloud_percent for
 -- the progress bar.  Pass false for folder views that don't show bars.
 local function _buildBookEntries(bf, settings, books, with_progress)
@@ -679,7 +704,7 @@ local function _buildFolderViewUI(self)
 
     -- How many rows fit in the remaining height (leave room for page nav)?
     local nav_h       = Screen:scaleBySize(40)
-    local remaining_h = content_h - back_h - nav_h - Screen:scaleBySize(8)
+    local remaining_h = content_h - back_h - nav_h - Screen:scaleBySize(16) - Screen:scaleBySize(4)
     local rows        = math.max(1, math.floor((remaining_h + cell_pad) / (cell_total_h + cell_pad)))
 
     local per_page    = cols * rows
@@ -698,6 +723,7 @@ local function _buildFolderViewUI(self)
 
     -- ── Build rows of covers ──
     local idx = first_idx
+    local actual_rows = 0
     for r = 1, rows do
         if idx > last_idx then break end
         local row_hg = HorizontalGroup:new{ align = "top" }
@@ -728,12 +754,13 @@ local function _buildFolderViewUI(self)
         end
         table.insert(vg, row_hg)
         table.insert(self.layout, row_layout)
+        actual_rows = actual_rows + 1
         if r < rows and idx <= last_idx then
             table.insert(vg, VerticalSpan:new{ width = cell_pad })
         end
     end
 
-    -- ── Bottom navigation ──
+    -- ── Bottom navigation (always pinned to bottom) ──
     local nav_hg = HorizontalGroup:new{ align = "center" }
     local arrow_size = Screen:scaleBySize(40)
 
@@ -795,11 +822,21 @@ local function _buildFolderViewUI(self)
     table.insert(nav_hg, right_arrow)
     table.insert(nav_hg, HorizontalSpan:new{ width = grid_pad_h })
 
-    if total_pages > 1 or has_more_api then
-        table.insert(vg, VerticalSpan:new{ width = Screen:scaleBySize(4) })
-        table.insert(vg, nav_hg)
-        table.insert(self.layout, { left_arrow, right_arrow })
+    -- Push navigation to the bottom of the available space by inserting
+    -- a spacer that fills the gap between the last cover row and the nav.
+    local top_gap = Screen:scaleBySize(4)  -- gap after back_row
+    local used_h = back_h + top_gap
+        + actual_rows * cell_total_h
+        + math.max(0, actual_rows - 1) * cell_pad
+    local nav_gap = Screen:scaleBySize(4)
+    local nav_bottom_margin = Screen:scaleBySize(16)
+    local bottom_spacer = content_h - used_h - nav_gap - arrow_size - nav_bottom_margin
+    if bottom_spacer > 0 then
+        table.insert(vg, VerticalSpan:new{ width = bottom_spacer })
     end
+    table.insert(vg, VerticalSpan:new{ width = nav_gap })
+    table.insert(vg, nav_hg)
+    table.insert(self.layout, { left_arrow, right_arrow })
 
     _commitVG()
 end
@@ -832,6 +869,13 @@ end
 -- folder rows directly into self.item_group. Populates self.layout for focus
 -- management and self.items_to_update for the lazy cover loader.
 local function _updateItemsBuildUI(self)
+    -- Re-check file existence so download badges stay current after
+    -- a book is downloaded or removed from the device.
+    if self._bf and self._settings then
+        pcall(_refreshDownloadStatus, self._books, self._bf, self._settings, true)
+        pcall(_refreshDownloadStatus, self._folder_books, self._bf, self._settings, false)
+    end
+
     -- Delegate to the folder view when a bookshelf is open.
     if self._view == "folder" then
         return _buildFolderViewUI(self)
@@ -1289,21 +1333,9 @@ function M.show()
         title                   = _("BookFusion"),
         left_icon               = "appbar.search",
         left_icon_tap_callback  = doSearch,
-        left_icon_size_ratio    = 0.8,
         right_icon              = "cre.render.reload",
         right_icon_tap_callback = doSync,
-        right_icon_size_ratio   = 0.8,
-        button_padding          = Screen:scaleBySize(15),
     }
-    -- Reduce the bottom hitbox so it doesn't overlap the back row in
-    -- folder views, making it hard to tap "← Back".
-    local btn_bottom_pad = Screen:scaleBySize(6)
-    if title_bar.left_button then
-        title_bar.left_button.padding_bottom = btn_bottom_pad
-    end
-    if title_bar.right_button then
-        title_bar.right_button.padding_bottom = btn_bottom_pad
-    end
 
     menu = PageMenu:new{
         name              = "bookfusion",
@@ -1320,16 +1352,64 @@ function M.show()
             if not item then return end
             local ok, err = pcall(function()
                 if item.book then
-                    browser:onSelectBook(item.book)
+                    local Downloader = bf.downloader
+                    local download_dir = Downloader.getDownloadDir(settings)
+                    local filename = Downloader.buildFilename(item.book)
+                    local filepath = download_dir .. "/" .. filename
+                    local function _refresh()
+                        UIManager:scheduleIn(0.1, function()
+                            if not menu then return end
+                            menu:updateItems()
+                            UIManager:setDirty("all", "full")
+                        end)
+                    end
+                    if Downloader.fileExists(filepath) then
+                        -- Book is downloaded — show read/remove dialog
+                        local ButtonDialog = require("ui/widget/buttondialog")
+                        local ConfirmBox   = require("ui/widget/confirmbox")
+                        local T            = require("ffi/util").template
+                        local bdialog
+                        bdialog = ButtonDialog:new{
+                            title   = item.book.title or _("Untitled"),
+                            buttons = {
+                                {{ text = _("Read"), callback = function()
+                                    UIManager:close(bdialog)
+                                    local ReaderUI = require("apps/reader/readerui")
+                                    ReaderUI:showReader(filepath)
+                                end }},
+                                {{ text = _("Remove from device"), callback = function()
+                                    UIManager:close(bdialog)
+                                    UIManager:show(ConfirmBox:new{
+                                        text = T(_("Remove \"%1\" from this device?"),
+                                               item.book.title or _("Untitled")),
+                                        ok_text = _("Remove"),
+                                        ok_callback = function()
+                                            os.remove(filepath)
+                                            _refresh()
+                                        end,
+                                    })
+                                end }},
+                            },
+                        }
+                        UIManager:show(bdialog)
+                    else
+                        -- Book not downloaded — offer to download
+                        Downloader.confirmDownload(api, settings, item.book, _refresh)
+                    end
                 elseif item.folder then
                     openFolderInline(item.folder)
                 elseif item.browse then
-                    if menu then
-                        menu._navbar_closing_intentionally = true
-                        UIManager:close(menu)
-                    end
                     local nbrowser = bf.browser:new(api, settings)
                     nbrowser:show()
+                    -- Keep our menu on the widget stack underneath the
+                    -- browser. Mark the browser _navbar_closing_intentionally
+                    -- so closing it doesn't trigger tab restoration (which
+                    -- would switch to the library via path-based resolution).
+                    -- Our menu stays visible and the bookfusion tab remains
+                    -- active after the browser is dismissed.
+                    if nbrowser._menu then
+                        nbrowser._menu._navbar_closing_intentionally = true
+                    end
                 end
             end)
             if not ok then
@@ -1349,12 +1429,29 @@ function M.show()
     menu._books      = cached_books and _buildBookEntries(bf, settings, cached_books, true) or nil
     menu._folders    = _buildFolderEntries()
     menu._strip_page = 1
+    menu._bf         = bf
+    menu._settings   = settings
 
     -- Plug in our custom layout / orchestration. We still reuse bf_covermenu's
     -- updateItems for the lazy image-loading pipeline (it iterates
     -- self.items_to_update and calls item:update() after each cover loads),
     -- but pair it with our own _recalculateDimen and _updateItemsBuildUI.
-    menu.updateItems          = bf.covermenu.updateItems
+    -- We wrap updateItems to schedule an extra full-content-area refresh,
+    -- because the base covermenu's refresh uses self.dimen which may not
+    -- cover the full painted area (its y is 0 until first paint, leaving
+    -- the bottom strip un-refreshed on e-ink).
+    local _base_updateItems = bf.covermenu.updateItems
+    menu.updateItems = function(self_menu, ...)
+        _base_updateItems(self_menu, ...)
+        UIManager:setDirty(self_menu.show_parent, function()
+            return "ui", Geom:new{
+                x = 0,
+                y = UI.getContentTop(),
+                w = Screen:getWidth(),
+                h = UI.getContentHeight(),
+            }
+        end)
+    end
     menu.onCloseWidget        = function(self_w)
         M._instance = nil
         if bf.covermenu.onCloseWidget then
