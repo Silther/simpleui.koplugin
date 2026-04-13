@@ -708,6 +708,7 @@ local function _buildFolderViewUI(self)
     local rows        = math.max(1, math.floor((remaining_h + cell_pad) / (cell_total_h + cell_pad)))
 
     local per_page    = cols * rows
+    self._folder_grid_per_page = per_page  -- used by fetchFolderPage
     local n           = #books
     local total_pages = math.max(1, math.ceil(n / per_page))
     local page        = self._folder_grid_page or 1
@@ -766,18 +767,26 @@ local function _buildFolderViewUI(self)
 
     local has_more_api = self._folder_total and n < self._folder_total
 
+    local arrow_pad  = Screen:scaleBySize(4)
+    local arrow_cell = arrow_size + 2 * arrow_pad  -- fixed width per arrow slot
     local function _nav_arrow(icon_name, enabled, on_tap)
+        local inner
         if enabled then
-            return IconButton:new{
+            inner = IconButton:new{
                 icon        = icon_name,
                 width       = arrow_size,
                 height      = arrow_size,
-                padding     = Screen:scaleBySize(4),
+                padding     = arrow_pad,
                 callback    = on_tap,
                 show_parent = self.show_parent,
             }
+        else
+            inner = HorizontalSpan:new{ width = arrow_cell }
         end
-        return HorizontalSpan:new{ width = arrow_size }
+        return CenterContainer:new{
+            dimen = Geom:new{ w = arrow_cell, h = arrow_size },
+            inner,
+        }
     end
 
     local left_arrow = _nav_arrow("chevron.left", page > 1, function()
@@ -792,16 +801,20 @@ local function _buildFolderViewUI(self)
         if page < total_pages then
             self._folder_grid_page = (self._folder_grid_page or 1) + 1
             self:updateItems()
+            -- Prefetch next batch in the background when nearing the end.
+            if self._prefetchIfNeeded then self._prefetchIfNeeded() end
         elseif has_more_api and self._loadMoreFolderBooks then
             self._loadMoreFolderBooks()
         end
     end)
 
-    -- Page label: "X / Y" or "X / Y+" when more API pages exist.
-    local page_text = string.format("%d / %d", page, total_pages)
-    if has_more_api then
-        page_text = page_text .. "+"
+    -- Page label: use total-count from the API when available so the
+    -- user sees the real total pages, not just the locally-loaded count.
+    local display_total = total_pages
+    if has_more_api and self._folder_total and per_page > 0 then
+        display_total = math.ceil(self._folder_total / per_page)
     end
+    local page_text = string.format("%d / %d", page, display_total)
     local page_label = TextWidget:new{
         text    = page_text,
         face    = Font:getFace("cfont", 14),
@@ -813,7 +826,7 @@ local function _buildFolderViewUI(self)
     table.insert(nav_hg, HorizontalSpan:new{ width = cell_pad })
     table.insert(nav_hg, CenterContainer:new{
         dimen = Geom:new{
-            w = grid_w - 2 * (arrow_size + cell_pad),
+            w = grid_w - 2 * (arrow_cell + cell_pad),
             h = arrow_size,
         },
         page_label,
@@ -1265,9 +1278,13 @@ function M.show()
         local NetworkMgr = require("ui/network/manager")
         NetworkMgr:runWhenOnline(function()
             UIManager:scheduleIn(0.05, function()
+                -- Request a multiple of the grid page size so loaded
+                -- books align with screen pages (no partial last pages).
+                local grid_pp = menu._folder_grid_per_page or 8
+                local api_pp  = grid_pp * 2
                 local params = {
                     page     = (menu._folder_api_page or 0) + 1,
-                    per_page = 20,
+                    per_page = api_pp,
                 }
                 for k, v in pairs(menu._folder_filters or {}) do
                     params[k] = v
@@ -1315,6 +1332,58 @@ function M.show()
                 if M._instance == menu and menu._view == "folder" then
                     menu:updateItems()
                 end
+            end)
+        end)
+    end
+
+    -- Background prefetch: silently loads the next batch when the user
+    -- is within 1 page of the end of loaded content.
+    local function prefetchIfNeeded()
+        if not menu or menu._view ~= "folder" then return end
+        if menu._folder_prefetching then return end
+        local n = menu._folder_books and #menu._folder_books or 0
+        local total = menu._folder_total or n
+        if n >= total then return end  -- all loaded
+        local grid_pp = menu._folder_grid_per_page or 8
+        local loaded_pages = math.ceil(n / grid_pp)
+        local current_page = menu._folder_grid_page or 1
+        if current_page < loaded_pages then return end  -- not near the end
+        menu._folder_prefetching = true
+        local NetworkMgr = require("ui/network/manager")
+        NetworkMgr:runWhenOnline(function()
+            UIManager:scheduleIn(0.05, function()
+                if not menu or menu._view ~= "folder" then
+                    menu._folder_prefetching = nil
+                    return
+                end
+                local api_pp = grid_pp * 2
+                local params = {
+                    page     = (menu._folder_api_page or 0) + 1,
+                    per_page = api_pp,
+                }
+                for k, v in pairs(menu._folder_filters or {}) do
+                    params[k] = v
+                end
+                if menu._folder_query and menu._folder_query ~= "" then
+                    params.query = menu._folder_query
+                end
+                if not params.sort then params.sort = "added_at-desc" end
+
+                local pf_ok, pf_data, pf_pagination = api:searchBooks(params)
+                menu._folder_prefetching = nil
+                if not pf_ok then return end
+
+                if pf_pagination then
+                    menu._folder_api_page = pf_pagination.page or ((menu._folder_api_page or 0) + 1)
+                    menu._folder_total    = pf_pagination.total
+                end
+                for _, book in ipairs(pf_data or {}) do
+                    table.insert(menu._folder_raw_books, book)
+                end
+                menu._folder_books = _buildBookEntries(bf, settings, menu._folder_raw_books, false)
+                -- Don't call updateItems — the user is still reading the
+                -- current page. The prefetched data is ready for when they
+                -- navigate forward.
             end)
         end)
     end
@@ -1463,6 +1532,7 @@ function M.show()
     menu._do_cover_images    = true
 
     -- Inline folder view helpers (closures need menu reference).
+    menu._prefetchIfNeeded = prefetchIfNeeded
     menu._fetchFolderPage = fetchFolderPage
     menu._loadMoreFolderBooks = function()
         -- Jump to the last grid page + 1 after loading (new books appear at end).
