@@ -46,27 +46,27 @@ local _BASE_LBL_W   = Screen:scaleBySize(44)
 local _BASE_COL_GAP = Screen:scaleBySize(8)
 local _BASE_BOT_PAD = Screen:scaleBySize(18)
 
--- Compact layout fixed dimensions (not user-scalable)
-local _COMPACT_ROW_FS  = Screen:scaleBySize(11)
-local _COMPACT_SUB_FS  = Screen:scaleBySize(10)
-local _COMPACT_ROW_H   = Screen:scaleBySize(20)
-local _COMPACT_ROW_GAP = Screen:scaleBySize(8)
-local _COMPACT_BAR_H   = Screen:scaleBySize(7)
-local _COMPACT_LBL_W   = Screen:scaleBySize(44)
-local _COMPACT_COL_GAP = Screen:scaleBySize(8)
-
--- Pre-resolved compact font faces — computed once at module load since
--- _COMPACT_ROW_FS / _COMPACT_SUB_FS are fixed constants, not user-scalable.
--- Avoids Font:getFace calls inside buildCompactGoalRow on every render.
-local _COMPACT_FACE_ROW -- forward-declared; resolved lazily on first use
-local _COMPACT_FACE_SUB -- so Font is available at resolution time
-local function _getCompactFaces()
-    if not _COMPACT_FACE_ROW then
-        local Font = require("ui/font")
-        _COMPACT_FACE_ROW = Font:getFace("smallinfofont", _COMPACT_ROW_FS)
-        _COMPACT_FACE_SUB = Font:getFace("cfont",         _COMPACT_SUB_FS)
-    end
-    return _COMPACT_FACE_ROW, _COMPACT_FACE_SUB
+-- Compact layout: no separate base constants needed.
+-- _compactDims(scale) reuses the _BASE_* constants (same raw values as default)
+-- and applies the given scale factor — which is always Config.getModuleScale()
+-- at call time. This means the landscape override in sui_homescreen
+-- (Config.getModuleScale *= 0.65) is automatically honoured, just like the
+-- default layout.
+local function _compactDims(scale)
+    scale = scale or 1.0
+    local row_fs = math.max(7, math.floor(_BASE_ROW_FS * scale))
+    local sub_fs = math.max(6, math.floor(_BASE_SUB_FS * scale))
+    return {
+        row_fs   = row_fs,
+        sub_fs   = sub_fs,
+        face_row = Font:getFace("smallinfofont", row_fs),
+        face_sub = Font:getFace("cfont",         sub_fs),
+        row_h    = math.max(8, math.floor(_BASE_ROW_H   * scale)),
+        row_gap  = math.max(4, math.floor(_BASE_ROW_GAP * scale)),
+        bar_h    = math.max(1, math.floor(_BASE_BAR_H   * scale)),
+        lbl_w    = math.max(20, math.floor(_BASE_LBL_W  * scale)),
+        col_gap  = math.max(2, math.floor(_BASE_COL_GAP * scale)),
+    }
 end
 
 local function _getYearStr() return os.date("%Y") end
@@ -141,9 +141,10 @@ local function _scaledDims(scale)
     }
 end
 
--- Returns total pixel height for n compact rows including inter-row gap
-local function _compactRowsHeight(n)
-    return n * _COMPACT_ROW_H + (n == 2 and _COMPACT_ROW_GAP or 0)
+-- Returns total pixel height for n compact rows including inter-row gap.
+-- Accepts a dims table from _compactDims() so it uses current screen geometry.
+local function _compactRowsHeight(n, cd)
+    return n * cd.row_h + (n == 2 and cd.row_gap or 0)
 end
 
 -- Renders a filled/empty progress bar of the given width and percentage
@@ -182,14 +183,14 @@ end
 -- Builds a single inline row: Label [bar] XX%  detail
 -- Used by the Compact layout. All elements are horizontally laid out and vertically centred.
 -- lbl_w is pre-computed by _measureLblW so both rows share the same column width.
-local function buildCompactGoalRow(inner_w, lbl_w, pct_w, label_str, pct, pct_str, detail_str, on_tap, face_row, face_sub)
+local function buildCompactGoalRow(inner_w, lbl_w, pct_w, label_str, pct, pct_str, detail_str, on_tap, cd)
     local LeftContainer  = require("ui/widget/container/leftcontainer")
     local RightContainer = require("ui/widget/container/rightcontainer")
 
-    local ROW_H       = _COMPACT_ROW_H
-    local LBL_BAR_GAP = _COMPACT_COL_GAP
-    local BAR_PCT_GAP    = _COMPACT_COL_GAP
-    local PCT_DETAIL_GAP = _COMPACT_COL_GAP
+    local ROW_H          = cd.row_h
+    local LBL_BAR_GAP    = cd.col_gap
+    local BAR_PCT_GAP    = cd.col_gap
+    local PCT_DETAIL_GAP = cd.col_gap
     -- right_w must be at least pct_w + gap + a minimum detail column.
     local MIN_DETAIL_W = Screen:scaleBySize(32)
     local right_w = math.max(
@@ -216,17 +217,17 @@ local function buildCompactGoalRow(inner_w, lbl_w, pct_w, label_str, pct, pct_st
         align = "center",
         vcenter_left(TextWidget:new{
             text    = label_str,
-            face    = face_row,
+            face    = cd.face_row,
             bold    = true,
             fgcolor = _CLR_TEXT_LBL,
             width   = lbl_w,
         }, lbl_w),
         HorizontalSpan:new{ width = LBL_BAR_GAP },
-        vcenter_left(buildProgressBar(bar_w, pct, _COMPACT_BAR_H), bar_w),
+        vcenter_left(buildProgressBar(bar_w, pct, cd.bar_h), bar_w),
         HorizontalSpan:new{ width = BAR_PCT_GAP },
         vcenter_left(TextWidget:new{
             text    = pct_str,
-            face    = face_row,
+            face    = cd.face_row,
             bold    = true,
             fgcolor = _CLR_TEXT_PCT,
             width   = PCT_W,
@@ -234,7 +235,7 @@ local function buildCompactGoalRow(inner_w, lbl_w, pct_w, label_str, pct, pct_st
         HorizontalSpan:new{ width = PCT_DETAIL_GAP },
         vcenter_right(TextWidget:new{
             text      = detail_str,
-            face      = face_sub,
+            face      = cd.face_sub,
             fgcolor   = CLR_TEXT_SUB,
             width     = DETAIL_W,
             alignment = "right",
@@ -481,8 +482,9 @@ function M.build(w, ctx)
     local compact = isCompact()
 
     if compact then
-        -- Resolve faces once; pass to buildCompactGoalRow to avoid Font:getFace per row.
-        local _face_row, _face_sub = _getCompactFaces()
+        -- Compute compact dims using Config.getModuleScale so the landscape
+        -- override in sui_homescreen (scale *= 0.65) is automatically honoured.
+        local cd = _compactDims(Config.getModuleScale("reading_goals", ctx.pfx))
         -- Capture year string once — avoids repeated os.date calls.
         local year_str = _getYearStr()
         -- Pre-compute data for both rows so we can measure pct_w across both
@@ -495,21 +497,21 @@ function M.build(w, ctx)
         local pct_strs = {}
         if show_ann and ann_pct_str ~= "" then pct_strs[#pct_strs+1] = ann_pct_str end
         if show_day and day_pct_str ~= "" then pct_strs[#pct_strs+1] = day_pct_str end
-        local pct_w = _measureLblW(pct_strs, _face_row, Screen:scaleBySize(28))
+        local pct_w = _measureLblW(pct_strs, cd.face_row, Screen:scaleBySize(28))
         if show_ann then
-            local lbl_w = _measureLblW({ year_str }, _face_row, _COMPACT_LBL_W)
+            local lbl_w = _measureLblW({ year_str }, cd.face_row, cd.lbl_w)
             rows[#rows+1] = buildCompactGoalRow(
                 inner_w, lbl_w, pct_w, year_str, ann_pct, ann_pct_str, ann_detail,
-                function() showAnnualGoalDialog() end, _face_row, _face_sub)
+                function() showAnnualGoalDialog() end, cd)
         end
         if show_ann and show_day then
-            rows[#rows+1] = VerticalSpan:new{ width = _COMPACT_ROW_GAP }
+            rows[#rows+1] = VerticalSpan:new{ width = cd.row_gap }
         end
         if show_day then
-            local lbl_w = _measureLblW({ _("Today") }, _face_row, _COMPACT_LBL_W)
+            local lbl_w = _measureLblW({ _("Today") }, cd.face_row, cd.lbl_w)
             rows[#rows+1] = buildCompactGoalRow(
                 inner_w, lbl_w, pct_w, _("Today"), day_pct, day_pct_str, day_detail,
-                function() showDailySettingsDialog() end, _face_row, _face_sub)
+                function() showDailySettingsDialog() end, cd)
         end
     else
         local scale    = Config.getModuleScale("reading_goals", ctx.pfx)
@@ -552,7 +554,7 @@ function M.getHeight(_ctx)
     if n == 0 then return 0 end
     local label_h = require("sui_config").getScaledLabelH()
     if isCompact() then
-        return label_h + _compactRowsHeight(n)
+        return label_h + _compactRowsHeight(n, _compactDims(Config.getModuleScale("reading_goals", _ctx and _ctx.pfx)))
     end
     local d = _scaledDims(Config.getModuleScale("reading_goals", _ctx and _ctx.pfx))
     return label_h + n * d.goal_row_h + (n == 2 and d.row_gap or 0)

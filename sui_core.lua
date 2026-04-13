@@ -202,7 +202,7 @@ function M.wrapWithNavbar(inner_widget, active_action_id, tabs, force_no_arrows)
         inner_widget.dimen = Geom:new{ w = screen_w, h = content_h }
     end
 
-    local bar_idx      = navbar_on and 3 or nil
+    local bar_idx
     local overlap_items = {
         dimen = Geom:new{ w = screen_w, h = screen_h },
         inner_widget,
@@ -212,21 +212,29 @@ function M.wrapWithNavbar(inner_widget, active_action_id, tabs, force_no_arrows)
         local bar_y = screen_h - navbar_h
         local bot_y = screen_h - Bottombar.BOT_SP()
 
+        local sep_color = Bottombar.sepColor()
+        local sep_h     = Bottombar.SEP_H()
+        local top_sp    = Bottombar.TOP_SP()
+        local side_m = Bottombar.SIDE_M()
+        -- Separator line with the same lateral padding as the bar itself,
+        -- matching the original per-tab separator visual exactly.
         local sep_line = LineWidget:new{
-            dimen      = Geom:new{ w = screen_w, h = Bottombar.TOP_SP() },
-            background = Blitbuffer.COLOR_WHITE,
+            dimen      = Geom:new{ w = screen_w - side_m * 2, h = sep_h },
+            background = sep_color,
         }
         local bot_pad = LineWidget:new{
             dimen      = Geom:new{ w = screen_w, h = Bottombar.BOT_SP() },
             background = Blitbuffer.COLOR_WHITE,
         }
-        sep_line.overlap_offset = { 0, bar_y }
-        bar.overlap_offset      = { 0, bar_y + Bottombar.TOP_SP() }
+        -- Separator sits immediately above the bar content (flush with the indicator).
+        sep_line.overlap_offset = { side_m, bar_y + top_sp - sep_h }
+        bar.overlap_offset      = { 0, bar_y + top_sp }
         bot_pad.overlap_offset  = { 0, bot_y }
 
         overlap_items[2] = sep_line
         overlap_items[3] = bar
         overlap_items[4] = bot_pad
+        bar_idx = 3
     end
 
     if topbar_on then

@@ -140,6 +140,28 @@ function M.patchFileManagerClass(plugin)
         -- Reset the "first show" guard so onShow reinitialises on the next open.
         fm_self._navbar_already_shown = nil
 
+        -- If HomescreenWidget:onSetRotationMode signalled a rotation reopen,
+        -- open the HS directly via scheduleIn(0) now that setupLayout has
+        -- rebuilt the FM at the new screen dimensions.
+        -- We cannot rely on onShow here because the FM is already on the
+        -- UIManager stack during reinit -- onShow only fires on first push.
+        local HS = liveHS()
+        if HS and HS._rotation_pending then
+            HS._rotation_pending = false
+            local rot_qa_tap   = HS._rotation_on_qa_tap
+            local rot_goal_tap = HS._rotation_on_goal_tap
+            HS._rotation_on_qa_tap   = nil
+            HS._rotation_on_goal_tap = nil
+            UIManager:scheduleIn(0, function()
+                local HS2 = liveHS()
+                if not HS2 then return end
+                if not plugin._goalTapCallback then plugin:addToMainMenu({}) end
+                local qa_tap   = rot_qa_tap   or function(aid) plugin:_navigate(aid, plugin.ui, Config.loadTabConfig(), false) end
+                local goal_tap = rot_goal_tap or plugin._goalTapCallback
+                HS2.show(qa_tap, goal_tap)
+            end)
+        end
+
         -- Patch FileChooser once on the class (not per instance) to shrink it
         -- to the content area and to flag external path changes.
         local FileChooser = require("ui/widget/filechooser")
@@ -178,15 +200,140 @@ function M.patchFileManagerClass(plugin)
             end
         end
 
+        -- Patch FileManager.reinit so that external callers (e.g. NewsDownloader
+        -- "Go to news folder") work correctly when the homescreen is on top.
+        --
+        -- Without this, reinit() silently rebuilds the FM underneath the
+        -- homescreen and the user never sees the target folder.
+        --
+        -- When the homescreen IS open we skip reinit entirely and instead:
+        --   1. Close the homescreen intentionally (suppresses _doShowHS reopen).
+        --   2. Navigate the already-visible FM to the requested path directly,
+        --      bypassing the onShow "go home" reset that showFiles would trigger.
+        --   3. Rebuild the navbar bar with the Library tab active.
+        --   4. Set _sui_show_folder_pending so that the calling TouchMenu closing
+        --      afterwards does not trigger another _doShowHS.
+        -- When the homescreen is NOT open the call is a transparent pass-through.
+        if not FileManager._simpleui_reinit_patched then
+            FileManager._simpleui_reinit_patched = true
+            local orig_reinit = FileManager.reinit
+            FileManager.reinit = function(fm_self, path, focused_file)
+                -- Rotation calls reinit with path=nil; pass those through
+                -- unconditionally — they must go through orig_reinit so that
+                -- setupLayout rebuilds the FM at the new screen dimensions.
+                if not path then
+                    return orig_reinit(fm_self, path, focused_file)
+                end
+
+                local HS      = liveHS()
+                local hs_inst = HS and HS._instance
+
+                -- Resolve the target path the same way reinit would.
+                local ffiUtil = require("ffi/util")
+                local resolved = ffiUtil.realpath(path) or path
+
+                -- Detect whether a foreign fullscreen widget (History,
+                -- Collections, etc.) is on top of the FM. These widgets sit
+                -- above the FM in the UIManager stack and cover it entirely;
+                -- orig_reinit would call setupLayout and rebuild the FM
+                -- underneath them, producing a visible glitch. Instead we
+                -- close every such widget first, then navigate manually.
+                --
+                -- Strategy: collect every widget above the FM that is neither
+                -- the FM itself nor the SimpleUI homescreen (already handled
+                -- via hs_inst), then close them all before proceeding.
+                local overlays = {}
+                if not hs_inst then
+                    local stack = UI.getWindowStack()
+                    -- Stack is bottom-to-top; find the FM position first.
+                    local fm_pos = 0
+                    for i, entry in ipairs(stack) do
+                        if entry.widget == fm_self then fm_pos = i; break end
+                    end
+                    -- Everything above the FM that is not the HS is an overlay.
+                    for i = fm_pos + 1, #stack do
+                        local w = stack[i].widget
+                        if w then overlays[#overlays + 1] = w end
+                    end
+                end
+
+                -- Pass-through when nothing special is on top: orig_reinit is
+                -- correct and complete for the plain FM case.
+                if not hs_inst and #overlays == 0 then
+                    return orig_reinit(fm_self, path, focused_file)
+                end
+
+                -- From here: either the HS is open, or foreign widgets sit
+                -- above the FM. Close them all before navigating.
+
+                -- 1a. Close the homescreen intentionally (only when open).
+                if hs_inst then
+                    hs_inst._navbar_closing_intentionally = true
+                    pcall(function() UIManager:close(hs_inst) end)
+                    hs_inst._navbar_closing_intentionally = nil
+                end
+
+                -- 1b. Close any overlay widgets (History, Collections, …)
+                --     top-to-bottom so each close is clean.
+                for i = #overlays, 1, -1 do
+                    pcall(function() UIManager:close(overlays[i]) end)
+                end
+
+                -- 2. Navigate the FM to the requested path.
+                --    Suppress onPathChanged — we rebuild the bar explicitly below.
+                if fm_self.file_chooser and resolved then
+                    fm_self._navbar_suppress_path_change = true
+                    pcall(function() fm_self.file_chooser:changeToPath(resolved) end)
+                    fm_self._navbar_suppress_path_change = nil
+                end
+
+                -- 3. Update the title bar to show the new path.
+                if fm_self.updateTitleBarPath then
+                    pcall(function() fm_self:updateTitleBarPath(resolved, false) end)
+                end
+
+                -- 4. Rebuild the navbar with the Library ("home") tab active.
+                local sui = fm_self._simpleui_plugin
+                if sui then sui.active_action = "home" end
+                local tabs = Config.loadTabConfig()
+                if fm_self._navbar_container then
+                    Bottombar.replaceBar(fm_self, Bottombar.buildBarWidget("home", tabs), tabs)
+                    UIManager:setDirty(fm_self, "ui")
+                end
+
+                -- 5. Suppress _doShowHS for the TouchMenu that closes after
+                --    the calling menu callback returns (relevant for hs_inst
+                --    case; harmless when only an overlay is present).
+                fm_self._sui_show_folder_pending = true
+            end
+        end
+
         orig_setupLayout(fm_self)
 
-        -- Apply title-bar customisations (no-op when the setting is off).
-        Titlebar.apply(fm_self)
+        -- Re-apply title-bar customisations to the fresh TitleBar instance that
+        -- orig_setupLayout just created.  We must use reapply (restore + apply)
+        -- rather than apply alone: apply guards itself with _titlebar_patched so
+        -- it is a no-op on subsequent calls (e.g. after a rotation reinit) unless
+        -- the flag is cleared first.  The restore step is safe on a brand-new
+        -- title_bar because apply() overwrites all geometry afterwards anyway.
+        Titlebar.reapply(fm_self)
 
-        -- Keep the original inner widget so repeated setupLayout calls wrap
-        -- the same child rather than wrapping the wrapper.
+        -- Use _navbar_inner to prevent wrapping the wrapper on repeated
+        -- setupLayout calls (e.g. after closing a book). Exception: when the
+        -- screen dimensions change (rotation), drop the cached widget so the
+        -- fresh FileChooser built by orig_setupLayout with the new dimensions
+        -- is used instead.
+        local cur_w = Screen:getWidth()
+        local cur_h = Screen:getHeight()
+        if fm_self._navbar_inner
+                and (fm_self._navbar_layout_w ~= cur_w
+                     or fm_self._navbar_layout_h ~= cur_h) then
+            fm_self._navbar_inner = nil
+        end
         local inner_widget = fm_self._navbar_inner or fm_self[1]
-        fm_self._navbar_inner = inner_widget
+        fm_self._navbar_inner    = inner_widget
+        fm_self._navbar_layout_w = cur_w
+        fm_self._navbar_layout_h = cur_h
 
         local tabs = Config.loadTabConfig()
         local navbar_container, wrapped, bar, topbar, bar_idx, topbar_on2, topbar_idx =
@@ -194,6 +341,12 @@ function M.patchFileManagerClass(plugin)
         UI.applyNavbarState(fm_self, navbar_container, bar, topbar, bar_idx, topbar_on2, topbar_idx, tabs)
         fm_self[1] = wrapped
         fm_self._simpleui_plugin = plugin
+
+        -- Resize pagination buttons (chevrons) on every setupLayout call so that
+        -- they use the correct Simple UI size after rotation rebuilds the FM.
+        -- onShow only fires on the first push to the UIManager stack, so without
+        -- this the buttons keep their default KOReader size after a rotation.
+        Bottombar.resizePaginationButtons(fm_self.file_chooser or fm_self, Bottombar.getPaginationIconSize())
 
         plugin:_updateFMHomeIcon()
 
@@ -212,19 +365,22 @@ function M.patchFileManagerClass(plugin)
             if orig_onShow then orig_onShow(this) end
             Bottombar.resizePaginationButtons(this.file_chooser or this, Bottombar.getPaginationIconSize())
 
-            -- Open the homescreen if it was flagged at setupLayout time (boot).
+            -- Open the homescreen if it was flagged at setupLayout time (boot or rotation).
             if this._hs_autoopen_pending then
                 this._hs_autoopen_pending = nil
+                local rot_qa_tap   = this._hs_rotation_on_qa_tap
+                local rot_goal_tap = this._hs_rotation_on_goal_tap
+                this._hs_rotation_on_qa_tap   = nil
+                this._hs_rotation_on_goal_tap = nil
                 UIManager:scheduleIn(0, function()
                     local HS = liveHS() or (function()
                         local ok, m = pcall(require, "sui_homescreen"); return ok and m
                     end)()
                     if HS then
                         if not plugin._goalTapCallback then plugin:addToMainMenu({}) end
-                        HS.show(
-                            function(aid) plugin:_navigate(aid, plugin.ui, Config.loadTabConfig(), false) end,
-                            plugin._goalTapCallback
-                        )
+                        local qa_tap   = rot_qa_tap   or function(aid) plugin:_navigate(aid, plugin.ui, Config.loadTabConfig(), false) end
+                        local goal_tap = rot_goal_tap or plugin._goalTapCallback
+                        HS.show(qa_tap, goal_tap)
                     end
                 end)
                 return
@@ -273,19 +429,6 @@ function M.patchFileManagerClass(plugin)
         end
 
         plugin:_registerTouchZones(fm_self)
-
-        -- onSetRotationMode: block non-portrait rotations in the FM.
-        -- Invalidates the dimension cache before blocking so onScreenResize
-        -- does not use stale values. The reader is unaffected (separate instance).
-        fm_self.onSetRotationMode = function(_self, mode)
-            if mode ~= 0 then
-                local ok, err = pcall(Bottombar.invalidateDimCache, Bottombar)
-                if not ok then
-                    logger.warn("simpleui: onSetRotationMode error:", tostring(err))
-                end
-            end
-            return true
-        end
 
         -- onPathChanged: update the active tab when the user navigates directories.
         -- Skipped when _navbar_suppress_path_change is set (programmatic navigation).
@@ -1228,6 +1371,32 @@ function M.patchUIManagerShow(plugin)
         else
             orig_show(um_self, widget)
         end
+
+        -- Clear the subtitle on the injected widget's own title_bar.
+        -- Menu:init calls updatePageInfo before UIManager.show, so
+        -- _setPageSubtitle may have already written the stale FM path
+        -- (_fm_path_base) into the widget's subtitle_widget. Wipe it
+        -- here, after orig_show, and also reset the shared upvalue so
+        -- future updatePageInfo calls on this widget stay clean.
+        do
+            local inj_tb = widget.title_bar
+            if inj_tb and inj_tb.subtitle_widget then
+                local pg     = widget.page     or 0
+                local pg_num = widget.page_num or 0
+                -- Rebuild subtitle without path: page indicator only (or empty).
+                local page_text = ""
+                if M._subtitleEnabled and M._subtitleEnabled()
+                        and pg_num and pg_num > 1 then
+                    local ffiUtil2 = require("ffi/util")
+                    page_text = ffiUtil2.template(_("Page %1 of %2"), pg, pg_num)
+                end
+                inj_tb:setSubTitle(page_text, true)
+            end
+            -- Also reset the shared upvalue so subsequent updatePageInfo
+            -- calls on this widget do not re-inject the FM path.
+            M.setFMPathBase("", plugin.ui)
+        end
+
         UIManager:setDirty(widget[1], "ui")
 
         -- Schedule a navpager arrow update for the next event-loop tick.
@@ -1378,6 +1547,16 @@ function M.patchUIManagerClose(plugin)
                 end
             else
                 plugin:_restoreTabInFM(nil, widget._navbar_prev_action)
+            end
+
+            -- Restore _fm_path_base from the FM's current folder so the
+            -- breadcrumb reappears in the subtitle after the overlay closes.
+            local fm_r = liveFM()
+            if fm_r then
+                local fc_r = fm_r.file_chooser
+                if fc_r and fc_r.path then
+                    pcall(function() fm_r:updateTitleBarPath(fc_r.path, false) end)
+                end
             end
         end
 
@@ -1840,6 +2019,64 @@ end
 -- installAll / teardownAll
 -- ---------------------------------------------------------------------------
 
+-- ---------------------------------------------------------------------------
+-- Debug: button bounds overlay
+-- When "simpleui_debug_button_bounds" is enabled, wraps Button:paintTo so
+-- every button draws a 2px border over itself, making it easy to verify
+-- the actual tap target real estate on device.
+-- ---------------------------------------------------------------------------
+
+function M.installButtonBoundsDebug(plugin)
+    local Button = package.loaded["ui/widget/button"]
+    if not Button then
+        -- Button not loaded yet; defer until first use via a lazy wrapper on
+        -- the Button module loader — we hook require instead.
+        local orig_require = _G.require
+        plugin._orig_require_for_bounds = orig_require
+        _G.require = function(modname, ...)
+            local result = orig_require(modname, ...)
+            if modname == "ui/widget/button" and not result._simpleui_bounds_patched then
+                M._wrapButtonPaintTo(plugin, result)
+            end
+            return result
+        end
+        return
+    end
+    if not Button._simpleui_bounds_patched then
+        M._wrapButtonPaintTo(plugin, Button)
+    end
+end
+
+function M._wrapButtonPaintTo(plugin, Button)
+    local Blitbuffer = require("ffi/blitbuffer")
+    local orig_paintTo = Button.paintTo
+    plugin._orig_button_paintTo = orig_paintTo
+    Button._simpleui_bounds_patched = true
+
+    Button.paintTo = function(btn_self, bb, x, y)
+        orig_paintTo(btn_self, bb, x, y)
+        if not G_reader_settings:isTrue("simpleui_debug_button_bounds") then return end
+        local dimen = btn_self:getSize()
+        if not dimen then return end
+        bb:paintBorder(x, y, dimen.w, dimen.h, 2, Blitbuffer.COLOR_RED)
+    end
+end
+
+function M.uninstallButtonBoundsDebug(plugin)
+    -- Restore the require hook if we set one.
+    if plugin._orig_require_for_bounds then
+        _G.require = plugin._orig_require_for_bounds
+        plugin._orig_require_for_bounds = nil
+    end
+    -- Restore Button:paintTo if Button was already loaded when we patched it.
+    local Button = package.loaded["ui/widget/button"]
+    if Button and plugin._orig_button_paintTo then
+        Button.paintTo = plugin._orig_button_paintTo
+        plugin._orig_button_paintTo     = nil
+        Button._simpleui_bounds_patched = nil
+    end
+end
+
 function M.installAll(plugin)
     M.patchFileManagerClass(plugin)
     M.patchStartWithMenu()
@@ -1851,6 +2088,10 @@ function M.installAll(plugin)
     M.patchMenuInitForPagination(plugin)
     M.patchMenuForNavpager(plugin)
     M.patchBookInfoNavigation(plugin)
+    -- Install button-bounds overlay when the debug setting is on at startup.
+    if G_reader_settings:isTrue("simpleui_debug_button_bounds") then
+        M.installButtonBoundsDebug(plugin)
+    end
     -- Folder covers are installed only when the feature is enabled to avoid
     -- wrapping MosaicMenuItem.update unconditionally, which would hide the
     -- BookInfoManager upvalue from third-party user-patches.
@@ -2001,6 +2242,8 @@ function M.teardownAll(plugin)
         Dispatcher._simpleui_execute_orig    = nil
         Dispatcher._simpleui_execute_patched = nil
     end
+
+    M.uninstallButtonBoundsDebug(plugin)
 
     -- Reset module-level state so a re-enable cycle starts clean.
     _hs_boot_done             = false

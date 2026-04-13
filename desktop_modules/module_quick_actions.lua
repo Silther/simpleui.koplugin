@@ -83,9 +83,10 @@ local function buildQAWidget(w, action_ids, show_labels, on_tap_fn, d, flat)
     for _, aid in ipairs(action_ids) do
         if aid:match("^custom_qa_%d+$") then
             if cqa_valid[aid] then valid_ids[#valid_ids + 1] = aid end
-        else
+        elseif Config.ACTION_BY_ID[aid] then
             valid_ids[#valid_ids + 1] = aid
         end
+        -- unknown IDs (neither a live custom QA nor a known built-in) are silently dropped
     end
     if #valid_ids == 0 then return nil end
 
@@ -316,8 +317,7 @@ local function makeSlot(slot)
                 text_func = function()
                     if isSelected(aid) then return _lbl end
                     local rem = MAX_QA - #getItems()
-                    if rem <= 0 then return _lbl .. "  (0 left)" end
-                    if rem <= 2 then return _lbl .. "  (" .. rem .. " left)" end
+                    if rem <= 2 then return _lbl .. string.format(N_("  (%d left)", "  (%d left)", rem), rem) end
                     return _lbl
                 end,
                 checked_func   = function() return isSelected(aid) end,

@@ -299,8 +299,36 @@ local function _tick()
         local sw      = Screen:getWidth()
         local SIDE_PAD = require("sui_core").SIDE_M()
         local inner_w  = hs._clock_inner_w or (sw - SIDE_PAD * 2)
+
+        -- In landscape mode the homescreen applies a scale reduction factor to
+        -- all modules.  Replicate it here so the surgical swap produces a widget
+        -- at the same size as the one built during _updatePage.
+        local lf = hs._clock_landscape_factor
+        local _orig_getModuleScale, _orig_getLabelScale, _orig_getThumbScale
+        if lf then
+            _orig_getModuleScale = Config.getModuleScale
+            _orig_getLabelScale  = Config.getLabelScale
+            _orig_getThumbScale  = Config.getThumbScale
+            Config.getModuleScale = function(mod_id, pfx)
+                return _orig_getModuleScale(mod_id, pfx) * lf
+            end
+            Config.getLabelScale = function()
+                return _orig_getLabelScale() * lf
+            end
+            Config.getThumbScale = function(mod_id, pfx)
+                return _orig_getThumbScale(mod_id, pfx) * lf
+            end
+        end
+
         local ok_w, new_widget = pcall(build, inner_w, hs._clock_pfx,
                                         hs._vspan_pool)
+
+        if lf then
+            Config.getModuleScale = _orig_getModuleScale
+            Config.getLabelScale  = _orig_getLabelScale
+            Config.getThumbScale  = _orig_getThumbScale
+        end
+
         if ok_w and new_widget then
             if is_wrapped then
                 -- The clock was wrapped in an InputContainer for hold-to-settings.

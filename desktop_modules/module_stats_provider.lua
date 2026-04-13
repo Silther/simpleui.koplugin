@@ -93,8 +93,12 @@ local function fetchTimeSeries(conn, start_today, week_start, year_start,
 
     local ok, err = pcall(function()
         -- day_buckets groups page_stat_data into one row per calendar day.
-        -- window_start = min(week_start, year_start) so a single table scan
-        -- covers all needed time ranges at once.
+        -- The CTE must scan the full table (window_start = 0) so that the
+        -- unconditional sum(sd) at the end produces a true all-time total.
+        -- math.min(week_start, year_start) always resolves to year_start,
+        -- which silently excluded data from previous years from total_secs.
+        -- Each time-window column (today, 7-day, year) is already bounded by
+        -- its own CASE WHEN predicate, so a full scan here is correct.
         --
         -- page_stat_data deduplicates page reads differently from the VIEW:
         -- we GROUP BY id_book,page inside the sum to avoid double-counting
@@ -103,7 +107,7 @@ local function fetchTimeSeries(conn, start_today, week_start, year_start,
         -- The outer SELECT uses CASE WHEN on the ISO-8601 date string column `d`
         -- to partition sums across time windows. Lexicographic comparison is
         -- correct and index-friendly for ISO-8601 dates.
-        local window_start = math.min(week_start, year_start)
+        local window_start = 0  -- full table scan; CASE WHEN cols handle windowing
         local sql = string.format([[
             WITH day_buckets AS (
                 SELECT

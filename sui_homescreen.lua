@@ -757,14 +757,24 @@ function HomescreenWidget:init()
                     -- retains the coordinates from the coverdeck's page even when a
                     -- different page is shown — without this guard, swipes on other
                     -- modules at the same Y position are incorrectly captured by coverdeck.
+                    -- In landscape spread mode the coverdeck may be on the partner page
+                    -- (current_page + 1), so check both pages of the spread.
                     local cd_on_current_page = false
                     do
                         local pom = self._enabled_mods_cache and self._enabled_mods_cache.pages_of_mods
-                        local cur_mods = pom and pom[self._current_page or 1]
-                        if cur_mods then
-                            for _, m in ipairs(cur_mods) do
-                                if m.id == "coverdeck" then cd_on_current_page = true; break end
+                        local cur = self._current_page or 1
+                        local is_ls = Screen:getWidth() > Screen:getHeight()
+                        local pages_to_check = { pom and pom[cur] }
+                        if is_ls and pom and pom[cur + 1] then
+                            pages_to_check[2] = pom[cur + 1]
+                        end
+                        for _, cur_mods in ipairs(pages_to_check) do
+                            if cur_mods then
+                                for _, m in ipairs(cur_mods) do
+                                    if m.id == "coverdeck" then cd_on_current_page = true; break end
+                                end
                             end
+                            if cd_on_current_page then break end
                         end
                     end
                     local cd_wrapper = cd_on_current_page and self._wrapper_pool and self._wrapper_pool["coverdeck"]
@@ -789,14 +799,25 @@ function HomescreenWidget:init()
 
                 local cur   = self._current_page or 1
                 local total = self._total_pages  or 1
+                -- In landscape mode pages are shown as spreads (pairs), so we
+                -- advance by 2.  _current_page is always kept on an odd index
+                -- so that page N and page N+1 form the left/right columns.
+                local step  = (Screen:getWidth() > Screen:getHeight()) and 2 or 1
                 local new_page
                 if dir == "west" then
-                    -- forward: cycle last → first
-                    new_page = cur < total and cur + 1 or 1
+                    -- forward: advance by step, cycle last → first
+                    new_page = cur + step
+                    if new_page > total then new_page = 1 end
                 else
-                    -- back: cycle first → last
-                    new_page = cur > 1 and cur - 1 or total
+                    -- back: retreat by step, cycle first → last
+                    new_page = cur - step
+                    if new_page < 1 then
+                        -- snap to the first page of the last spread
+                        new_page = (step == 2) and (total % 2 == 0 and total - 1 or total) or total
+                    end
                 end
+                -- Always land on an odd page in landscape (first of a spread).
+                if step == 2 and new_page % 2 == 0 then new_page = new_page - 1 end
                 if new_page ~= cur or total == 1 then
                     self._current_page = new_page
                     self.page          = new_page
@@ -839,7 +860,7 @@ function HomescreenWidget:init()
     end
     if Device:hasKeys() then
         self.key_events.HSOpenMenu   = { { "Menu"  } }
-        self.key_events.PrevPage     = { { Device.input.group.PgBwd } }
+        self.key_events.PrevPage     = { { Device.input.group.PgBack } }
         self.key_events.NextPage     = { { Device.input.group.PgFwd } }
     end
 
@@ -966,9 +987,14 @@ function HomescreenWidget:init()
     -- Without them the navpager arrows do nothing on the homescreen.
     -- ---------------------------------------------------------------------------
     function self:onPrevPage()
-        local cur = self._current_page or 1
-        if cur > 1 then
-            self._current_page = cur - 1
+        local cur  = self._current_page or 1
+        local step = (Screen:getWidth() > Screen:getHeight()) and 2 or 1
+        local new_page = cur - step
+        if new_page < 1 then new_page = 1 end
+        -- Always land on an odd page in landscape (first of a spread).
+        if step == 2 and new_page % 2 == 0 then new_page = new_page - 1 end
+        if new_page ~= cur then
+            self._current_page = new_page
             self.page          = self._current_page
             self:_refresh(true)
         end
@@ -978,8 +1004,13 @@ function HomescreenWidget:init()
     function self:onNextPage()
         local cur   = self._current_page or 1
         local total = self._total_pages  or 1
-        if cur < total then
-            self._current_page = cur + 1
+        local step  = (Screen:getWidth() > Screen:getHeight()) and 2 or 1
+        local new_page = cur + step
+        if new_page > total then new_page = total end
+        -- Always land on an odd page in landscape (first of a spread).
+        if step == 2 and new_page % 2 == 0 then new_page = new_page - 1 end
+        if new_page ~= cur then
+            self._current_page = new_page
             self.page          = self._current_page
             self:_refresh(true)
         end
@@ -987,8 +1018,16 @@ function HomescreenWidget:init()
     end
 
     function self:onGotoPage(page)
+        -- page here is a spread index (1-based) when in landscape mode.
+        -- Convert it back to the raw page index (first page of the spread).
         local total = self._total_pages or 1
-        local p     = math.max(1, math.min(page, total))
+        local raw
+        if Screen:getWidth() > Screen:getHeight() and total > 1 then
+            raw = (page - 1) * 2 + 1
+        else
+            raw = page
+        end
+        local p = math.max(1, math.min(raw, total))
         self._current_page = p
         self.page          = p
         self:_refresh(true)
@@ -1251,14 +1290,22 @@ function HomescreenWidget:init()
                 local total = self_ref._total_pages  or 1
                 if total <= 1 then return false end
 
+                -- In landscape, advance by spreads (step=2); wrap cyclically.
+                local step  = (Screen:getWidth() > Screen:getHeight()) and 2 or 1
                 local new_page
                 if dir == "west" then
-                    new_page = cur < total and cur + 1 or 1
+                    new_page = cur + step
+                    if new_page > total then new_page = 1 end
                 elseif dir == "east" then
-                    new_page = cur > 1 and cur - 1 or total
+                    new_page = cur - step
+                    if new_page < 1 then
+                        new_page = (step == 2) and (total % 2 == 0 and total - 1 or total) or total
+                    end
                 else
                     return false  -- north/south swipes: do not consume
                 end
+                -- Always land on an odd page in landscape.
+                if step == 2 and new_page % 2 == 0 then new_page = new_page - 1 end
 
                 if new_page ~= cur then
                     self_ref._current_page = new_page
@@ -1379,18 +1426,33 @@ function HomescreenWidget:_initLayout()
     }
 
     -- Navigation callback shared by both footer types.
+    -- In landscape mode `page` is a spread index (1-based); convert to raw page.
     local self_ref = self
     local function _goto(page)
-        local total = self_ref._total_pages or 1
-        local target
-        if     page == "prev" then target = (self_ref._current_page or 1) - 1
-        elseif page == "next" then target = (self_ref._current_page or 1) + 1
-        elseif page == "last" then target = total
-        else                       target = page
+        local total     = self_ref._total_pages or 1
+        local is_ls     = Screen:getWidth() > Screen:getHeight()
+        local step      = (is_ls and total > 1) and 2 or 1
+        local cur_raw   = self_ref._current_page or 1
+        local target_raw
+        if page == "prev" then
+            target_raw = cur_raw - step
+            if target_raw < 1 then target_raw = 1 end
+        elseif page == "next" then
+            target_raw = cur_raw + step
+            if target_raw > total then target_raw = total end
+        elseif page == "last" then
+            -- Last spread starts at the last odd index.
+            target_raw = (step == 2) and (total % 2 == 0 and total - 1 or total) or total
+        else
+            -- page is a spread number; convert to raw.
+            target_raw = (step == 2) and ((page - 1) * 2 + 1) or page
+            target_raw = math.max(1, math.min(target_raw, total))
         end
-        target = math.max(1, math.min(target, total))
-        if target ~= self_ref._current_page then
-            self_ref._current_page = target
+        -- Always land on an odd page in landscape (first of a spread).
+        if step == 2 and target_raw % 2 == 0 then target_raw = target_raw - 1 end
+        target_raw = math.max(1, math.min(target_raw, total))
+        if target_raw ~= cur_raw then
+            self_ref._current_page = target_raw
             self_ref:_refresh(true)  -- calls _updatePage + setDirty, consistent with navpager/swipe
         end
     end
@@ -1881,6 +1943,13 @@ function HomescreenWidget:_updatePage(keep_cache, books_only)
     -- Clamp page.
     if self._current_page > total_pages then self._current_page = total_pages end
     if self._current_page < 1           then self._current_page = 1           end
+    -- In landscape mode _current_page must always be odd (first of a spread).
+    -- Normalise here so state is consistent regardless of how we arrived
+    -- (rotation, restore, direct set from portrait navigation, etc.).
+    if Screen:getWidth() > Screen:getHeight() and total_pages > 1
+       and self._current_page % 2 == 0 then
+        self._current_page = self._current_page - 1
+    end
     self._total_pages = total_pages
     self.page         = self._current_page
     self.page_num     = total_pages
@@ -1940,37 +2009,264 @@ function HomescreenWidget:_updatePage(keep_cache, books_only)
     local first_mod     = true
     local page_has_covers = false
 
-    for _, mod in ipairs(cur_page_mods) do
-        -- Detect cover modules in the same pass — avoids a second loop.
-        if _COVER_MOD_IDS[mod.id] then page_has_covers = true end
-        local ok_w, widget = pcall(mod.build, inner_w, ctx)
-        if not ok_w then
-            logger.warn("simpleui homescreen: build failed for "
-                        .. tostring(mod.id) .. ": " .. tostring(widget))
-        elseif widget then
-            if first_mod then
-                first_mod = false
+    -- ── Landscape two-column layout ──────────────────────────────────────────
+    -- In landscape mode (width > height) modules are arranged in two columns.
+    --
+    -- SPREAD MODE (even total pages, or any page that has a partner):
+    --   Left column  = all modules from the current (odd) page.
+    --   Right column = all modules from the next (even) page.
+    --   full_width is ignored in landscape — every module goes into its column.
+    --
+    -- SOLO MODE (lone odd page at the end of an odd-count list):
+    --   The single page's modules are split in half across both columns,
+    --   preserving the original behaviour.
+    --
+    -- Each column gets (inner_w - COL_GAP) / 2 width.
+    local is_landscape = Screen:getWidth() > Screen:getHeight()
+    local COL_GAP      = PAD  -- horizontal gap between the two columns
+
+    if is_landscape then
+        -- ── Landscape scale reduction ────────────────────────────────────────
+        -- In landscape mode every module is scaled down by 20% on top of
+        -- whatever portrait scale the user configured.  We achieve this by
+        -- temporarily overriding the three Config scale accessors used by
+        -- all module build() and getHeight() calls.  The originals are
+        -- restored immediately after the build loop completes, so settings
+        -- are never mutated and the portrait homescreen is unaffected.
+        local LANDSCAPE_FACTOR = 0.65
+        -- Store on the widget so module_clock._tick can apply the same
+        -- factor when it does its surgical widget swap.
+        self._clock_landscape_factor = LANDSCAPE_FACTOR
+        local _orig_getModuleScale    = Config.getModuleScale
+        local _orig_getLabelScale     = Config.getLabelScale
+        local _orig_getThumbScale     = Config.getThumbScale
+        Config.getModuleScale = function(mod_id, pfx)
+            return _orig_getModuleScale(mod_id, pfx) * LANDSCAPE_FACTOR
+        end
+        Config.getLabelScale = function()
+            return _orig_getLabelScale() * LANDSCAPE_FACTOR
+        end
+        Config.getThumbScale = function(mod_id, pfx)
+            return _orig_getThumbScale(mod_id, pfx) * LANDSCAPE_FACTOR
+        end
+
+        -- col_w: width available to each module in a column.
+        local col_w = math.floor((inner_w - COL_GAP) / 2)
+
+        -- ── Determine spread vs. solo mode ───────────────────────────────────
+        -- Spread: the current page has a partner (pages_of_mods[current+1] exists).
+        -- Solo:   this is the last page and there is no partner (odd total).
+        local right_page_mods = pages_of_mods[self._current_page + 1]
+        local is_spread       = right_page_mods ~= nil
+
+        -- Build widgets for each column, skipping failed builds.
+        -- Each entry: { mod=, widget= }
+        local left_col  = {}
+        local right_col = {}
+
+        if is_spread then
+            -- ── Spread mode: left = current page, right = next page ──────────
+            -- full_width is ignored in landscape; all modules go into their column.
+            for _, mod in ipairs(cur_page_mods) do
+                if _COVER_MOD_IDS[mod.id] then page_has_covers = true end
+                local ok_w, widget = pcall(mod.build, col_w, ctx)
+                if not ok_w or not widget then
+                    logger.warn("simpleui homescreen: build failed for "
+                                .. tostring(mod.id) .. ": " .. tostring(widget))
+                else
+                    left_col[#left_col + 1] = { mod = mod, widget = widget }
+                end
+            end
+            for _, mod in ipairs(right_page_mods) do
+                if _COVER_MOD_IDS[mod.id] then page_has_covers = true end
+                local ok_w, widget = pcall(mod.build, col_w, ctx)
+                if not ok_w or not widget then
+                    logger.warn("simpleui homescreen: build failed for "
+                                .. tostring(mod.id) .. ": " .. tostring(widget))
+                else
+                    right_col[#right_col + 1] = { mod = mod, widget = widget }
+                end
+            end
+        else
+            -- ── Solo mode: split this page's modules in half (original) ──────
+            -- full_width is ignored in landscape; all modules go into columns.
+            local col_mods = {}
+            for _, mod in ipairs(cur_page_mods) do
+                if _COVER_MOD_IDS[mod.id] then page_has_covers = true end
+                col_mods[#col_mods + 1] = mod
+            end
+            local n_col    = #col_mods
+            local split_at = math.ceil(n_col / 2)
+            for i, mod in ipairs(col_mods) do
+                local ok_w, widget = pcall(mod.build, col_w, ctx)
+                if not ok_w or not widget then
+                    logger.warn("simpleui homescreen: build failed for "
+                                .. tostring(mod.id) .. ": " .. tostring(widget))
+                else
+                    if i <= split_at then
+                        left_col[#left_col + 1]  = { mod = mod, widget = widget }
+                    else
+                        right_col[#right_col + 1] = { mod = mod, widget = widget }
+                    end
+                end
+            end
+        end
+
+        -- ── Build each column into a VerticalGroup ───────────────────────────
+        local function _build_col_group(entries)
+            local col_body = VerticalGroup:new{ align = "left" }
+            local col_first = true
+            for _, entry in ipairs(entries) do
+                local mod    = entry.mod
+                local widget = entry.widget
+                if col_first then col_first = false
+                else col_body[#col_body+1] = self:_vspan(mod_gaps[mod.id] or MOD_GAP) end
+                if mod.label then col_body[#col_body+1] = sectionLabel(mod.label, col_w) end
+                local has_menu = type(mod.getMenuItems) == "function"
+                local entry_widget = has_menu
+                    and self:_makeModWrapper(mod, widget, col_w)
+                    or  widget
+                col_body[#col_body+1] = entry_widget
+            end
+            return col_body
+        end
+
+        -- ── Emit the two-column row if there are any column modules ──────────
+        if #left_col > 0 or #right_col > 0 then
+            if first_mod then first_mod = false
+            else body[#body+1] = self:_vspan(MOD_GAP) end
+
+            local left_group  = _build_col_group(left_col)
+            local right_group = _build_col_group(right_col)
+
+            local row = HorizontalGroup:new{
+                align = "top",
+                left_group,
+                HorizontalSpan:new{ width = COL_GAP },
+                right_group,
+            }
+            body[#body+1] = row
+
+            -- Fix clock tick swap: point _clock_body_ref / _clock_body_idx at
+            -- the VerticalGroup that owns the clock widget so module_clock's
+            -- surgical body[idx] = new_widget swap targets the correct slot.
+            -- We scan both columns to find which VerticalGroup contains the clock.
+            local function _find_clock_in_col(col_entries, col_group)
+                local gi = 1  -- index into col_group children
+                for _, entry in ipairs(col_entries) do
+                    -- Each entry may emit: optional gap, optional label, widget/wrapper
+                    -- Mirror the order used in _build_col_group above.
+                    -- We only need the slot of the final widget/wrapper child.
+                    local has_menu = type(entry.mod.getMenuItems) == "function"
+                    -- Count how many children were added for this entry.
+                    -- (gap already counted if not col_first; label if present)
+                    -- Simpler: walk col_group children and find the clock's widget.
+                    if entry.mod.id == "clock" then
+                        -- Find the index of this entry's widget in col_group.
+                        for idx = 1, #col_group do
+                            local child = col_group[idx]
+                            local target = has_menu
+                                and self:_makeModWrapper(entry.mod, entry.widget, col_w)
+                                or  entry.widget
+                            -- _makeModWrapper returns a pooled wrapper; compare by ref
+                            -- to the wrapper already in col_group at this slot.
+                            if child == col_group[idx] then
+                                -- Walk to find the actual widget slot.
+                                -- Because _makeModWrapper is pooled we check the child
+                                -- stored in col_group against what _build_col_group put there.
+                                -- The simplest reliable approach: track index while building.
+                                -- We'll use the approach below instead.
+                            end
+                        end
+                        return true
+                    end
+                end
+                return false
+            end
+
+            -- Simpler and reliable: rebuild the column index by scanning col_group.
+            -- _build_col_group inserts children in order: [gap,] [label,] widget.
+            -- We track a running child index while replaying the same logic.
+            local function _locate_clock_idx(col_entries, col_group)
+                local gi        = 0
+                local col_first = true
+                for _, entry in ipairs(col_entries) do
+                    if col_first then col_first = false
+                    else gi = gi + 1 end  -- gap span
+                    if entry.mod.label then gi = gi + 1 end  -- label
+                    gi = gi + 1  -- widget or wrapper
+                    if entry.mod.id == "clock" then
+                        return gi
+                    end
+                end
+                return nil
+            end
+
+            local lci = _locate_clock_idx(left_col,  left_group)
+            if lci then
+                self._clock_body_ref   = left_group
+                self._clock_body_idx   = lci
+                for _, e in ipairs(left_col) do
+                    if e.mod.id == "clock" then
+                        self._clock_is_wrapped = type(e.mod.getMenuItems) == "function"
+                        break
+                    end
+                end
             else
-                local gap_px = mod_gaps[mod.id] or MOD_GAP
-                body[#body+1] = self:_vspan(gap_px)
+                local rci = _locate_clock_idx(right_col, right_group)
+                if rci then
+                    self._clock_body_ref = right_group
+                    self._clock_body_idx = rci
+                    for _, e in ipairs(right_col) do
+                        if e.mod.id == "clock" then
+                            self._clock_is_wrapped = type(e.mod.getMenuItems) == "function"
+                            break
+                        end
+                    end
+                end
             end
-            if mod.label then body[#body+1] = sectionLabel(mod.label, inner_w) end
-            local has_menu = type(mod.getMenuItems) == "function"
-            if mod.id == "header" then
-                self._header_body_idx   = #body + 1
-                self._header_is_wrapped = has_menu
-            end
-            if mod.id == "clock" then
-                self._clock_body_idx   = #body + 1
-                self._clock_body_ref   = body
-                self._clock_is_wrapped = has_menu
-            end
-            if has_menu then
-                -- Pooled wrapper — allocated once per mod.id per Homescreen
-                -- lifetime; updated in-place on subsequent page turns.
-                body[#body+1] = self:_makeModWrapper(mod, widget, inner_w)
-            else
-                body[#body+1] = widget
+        end
+
+        -- Restore original Config scale functions now that all landscape
+        -- module builds are complete.
+        Config.getModuleScale = _orig_getModuleScale
+        Config.getLabelScale  = _orig_getLabelScale
+        Config.getThumbScale  = _orig_getThumbScale
+    else
+        -- ── Portrait single-column layout (unchanged) ─────────────────────────
+        self._clock_landscape_factor = nil  -- portrait: no scaling needed
+        for _, mod in ipairs(cur_page_mods) do
+            -- Detect cover modules in the same pass — avoids a second loop.
+            if _COVER_MOD_IDS[mod.id] then page_has_covers = true end
+            local ok_w, widget = pcall(mod.build, inner_w, ctx)
+            if not ok_w then
+                logger.warn("simpleui homescreen: build failed for "
+                            .. tostring(mod.id) .. ": " .. tostring(widget))
+            elseif widget then
+                if first_mod then
+                    first_mod = false
+                else
+                    local gap_px = mod_gaps[mod.id] or MOD_GAP
+                    body[#body+1] = self:_vspan(gap_px)
+                end
+                if mod.label then body[#body+1] = sectionLabel(mod.label, inner_w) end
+                local has_menu = type(mod.getMenuItems) == "function"
+                if mod.id == "header" then
+                    self._header_body_idx   = #body + 1
+                    self._header_is_wrapped = has_menu
+                end
+                if mod.id == "clock" then
+                    self._clock_body_idx   = #body + 1
+                    self._clock_body_ref   = body
+                    self._clock_is_wrapped = has_menu
+                end
+                if has_menu then
+                    -- Pooled wrapper — allocated once per mod.id per Homescreen
+                    -- lifetime; updated in-place on subsequent page turns.
+                    body[#body+1] = self:_makeModWrapper(mod, widget, inner_w)
+                else
+                    body[#body+1] = widget
+                end
             end
         end
     end
@@ -1989,11 +2285,22 @@ function HomescreenWidget:_updatePage(keep_cache, books_only)
     -- mode does not do a full pixel cycle. Flag was set inside the build loop above.
     self.dithered = page_has_covers or nil
 
+    -- In landscape mode pages are shown in pairs (spreads).
+    -- The footer and navpager should reflect the number of spreads, not raw pages.
+    local footer_page, footer_total
+    if is_landscape and total_pages > 1 then
+        footer_total = math.ceil(total_pages / 2)
+        footer_page  = math.ceil(self._current_page / 2)
+    else
+        footer_total = total_pages
+        footer_page  = self._current_page
+    end
+
     -- Update footer in-place (zero allocation on page turns).
-    self:_updateFooter(self._current_page, total_pages, topbar_on)
+    self:_updateFooter(footer_page, footer_total, topbar_on)
 
     -- Navpager arrows (external to the layout).
-    _updateNavpagerForHS(self._current_page, total_pages)
+    _updateNavpagerForHS(footer_page, footer_total)
 
     -- Clock synchronisation after page turn.
     -- When the clock module is on the current page (_clock_body_idx ~= nil),
@@ -2188,6 +2495,52 @@ function HomescreenWidget:onResume()
     if ClockMod and Registry.isEnabled(ClockMod, PFX) and ClockMod.scheduleRefresh then
         ClockMod.scheduleRefresh(self)
     end
+end
+
+function HomescreenWidget:onSetRotationMode(mode)
+    -- If the reader is open, this rotation event originated inside ReaderUI.
+    -- The reader handles its own layout in-place via SetDimensions/onScreenResize
+    -- and does NOT close+reopen itself on rotation. Closing and rebuilding the
+    -- homescreen underneath an active reader corrupts the UIManager widget stack
+    -- on some Kobo builds and causes the reader to exit unexpectedly.
+    local RUI = package.loaded["apps/reader/readerui"]
+    if RUI and RUI.instance then return end
+
+    -- The Screen has already been rotated by FileManager:onSetRotationMode before
+    -- this event reaches HomescreenWidget via broadcastEvent. Check whether the
+    -- dimensions actually changed -- portrait<->inverted-portrait and
+    -- landscape<->inverted-landscape keep the same w/h and need no rebuild.
+    local new_w = Screen:getWidth()
+    local new_h = Screen:getHeight()
+    if new_w == (self._layout_sw or new_w) and new_h == (self._layout_content_h or new_h) then
+        return
+    end
+
+    -- Invalidate shared dimension caches (section labels, etc.) so they are
+    -- rebuilt at the new inner_w on the next render.
+    local UI = require("sui_core")
+    UI.invalidateDimCache()
+
+    -- Preserve callbacks and cheap state across the close/reopen cycle.
+    local on_qa_tap   = self._on_qa_tap
+    local on_goal_tap = self._on_goal_tap
+
+    -- Promote the book cache to the module table so Homescreen.show() can pass
+    -- it into the new widget, skipping the expensive prefetchBooks() IO.
+    Homescreen._cached_books_state = self._cached_books_state
+    Homescreen._current_page       = self._current_page
+
+    -- Signal that a rotation reopen is pending. Our setupLayout patch in
+    -- sui_patches.lua reads this flag and sets _hs_autoopen_pending on the
+    -- new FM instance so its onShow reopens the HS -- identical to boot.
+    -- Callbacks are stashed on the Homescreen module table (not on the closing
+    -- widget) so setupLayout can retrieve them without a reference to self.
+    Homescreen._rotation_on_qa_tap   = on_qa_tap
+    Homescreen._rotation_on_goal_tap = on_goal_tap
+    Homescreen._rotation_pending     = true
+
+    UIManager:close(self)
+    return true
 end
 
 function HomescreenWidget:onCloseWidget()

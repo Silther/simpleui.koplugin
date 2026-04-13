@@ -154,28 +154,78 @@ end
 -- An id is orphaned when it is referenced in a slot but not in the master list.
 -- Safe to call at startup and after any QA deletion.
 function QA.sanitizeQASlots()
+    local Config = require("sui_config")
+
+    -- 0. Clean the master list itself: remove any ID whose config record is
+    --    missing or empty (orphaned entry with no label/path/etc.).
+    --    This is the root cause of "invalid items that can't be removed".
     local list = QA.getCustomQAList()
-    local valid = {}
-    for _i, id in ipairs(list) do valid[id] = true end
-    local changed = false
+    local clean_list = {}
+    local list_changed = false
+    for _i, id in ipairs(list) do
+        if id:match("^custom_qa_%d+$") then
+            local cfg = G_reader_settings:readSetting(getQASettingsKey(id))
+            if type(cfg) == "table" and next(cfg) then
+                clean_list[#clean_list + 1] = id
+            else
+                list_changed = true  -- orphan: no config record
+            end
+        else
+            list_changed = true  -- malformed ID
+        end
+    end
+    if list_changed then
+        QA.saveCustomQAList(clean_list)
+        list = clean_list
+    end
+
+    local valid_custom = {}
+    for _i, id in ipairs(list) do valid_custom[id] = true end
+    local changed = list_changed
+
+    -- 1. Clean navbar_homescreen_quick_actions_N_items (HS quick-action slots).
     for _, pfx in ipairs({ "navbar_homescreen_quick_actions_" }) do
         for slot = 1, 3 do
             local key  = pfx .. slot .. "_items"
             local items = G_reader_settings:readSetting(key)
             if type(items) == "table" then
                 local clean = {}
+                local slot_changed = false
                 for _i, id in ipairs(items) do
-                    -- Keep built-in action ids and valid custom QA ids
-                    if not id:match("^custom_qa_%d+$") or valid[id] then
+                    if not id:match("^custom_qa_%d+$") or valid_custom[id] then
                         clean[#clean+1] = id
                     else
+                        slot_changed = true
                         changed = true
                     end
                 end
-                if changed then G_reader_settings:saveSetting(key, clean) end
+                if slot_changed then G_reader_settings:saveSetting(key, clean) end
             end
         end
     end
+
+    -- 2. Clean navbar_tabs — remove IDs that are neither a known built-in nor
+    --    a live custom QA.  loadTabConfig already silently skips unknowns but
+    --    never writes them back, so stale IDs persist across restarts.
+    local tabs = G_reader_settings:readSetting("navbar_tabs")
+    if type(tabs) == "table" then
+        local clean_tabs = {}
+        local tabs_changed = false
+        for _i, id in ipairs(tabs) do
+            if Config.ACTION_BY_ID[id]
+                    or (id:match("^custom_qa_%d+$") and valid_custom[id]) then
+                clean_tabs[#clean_tabs + 1] = id
+            else
+                tabs_changed = true
+                changed = true
+            end
+        end
+        if tabs_changed then
+            G_reader_settings:saveSetting("navbar_tabs", clean_tabs)
+            Config.invalidateTabsCache()
+        end
+    end
+
     if changed then
         local mqa = package.loaded["desktop_modules/module_quick_actions"]
         if mqa and mqa.invalidateCustomQACache then mqa.invalidateCustomQACache() end

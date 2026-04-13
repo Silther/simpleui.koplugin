@@ -52,6 +52,8 @@ local function _sepColor()
     end
     return M.COLOR_SEPARATOR
 end
+-- Public accessor used by sui_core.lua to draw the full-width separator line.
+function M.sepColor() return _sepColor() end
 
 -- ---------------------------------------------------------------------------
 -- Dimension cache — computed once, invalidated on screen resize or size change.
@@ -94,15 +96,10 @@ end
 -- buildTabCell so all references resolve correctly.
 local _vspan_icon_top = nil
 local _vspan_icon_txt = nil
-local _lw_sep         = nil  -- top separator  (sep colour × SEP_H)
-local _lw_indic_w     = nil  -- inactive indicator (white × INDIC_H)
-
 function M.invalidateDimCache()
     _dim             = {}
     _vspan_icon_top  = nil
     _vspan_icon_txt  = nil
-    _lw_sep          = nil
-    _lw_indic_w      = nil
     _old_touch_zones = nil
 end
 
@@ -193,36 +190,11 @@ function M.getTabWidths(num_tabs, usable_w)
     return _tab_widths_cache
 end
 
--- Builds one tab cell: separator, active indicator, icon and/or label.
+-- Builds one tab cell: active indicator (pinned to top) + icon and/or label.
+-- The visible separator line is drawn full-width in wrapWithNavbar (sui_core.lua).
 function M.buildTabCell(action_id, active, tab_w, mode)
     local action = Config.getActionById(action_id)
     local vg     = VerticalGroup:new{ align = "center" }
-
-    -- Separator — shared singleton (same colour, same height for all tabs).
-    if not _lw_sep then
-        _lw_sep = LineWidget:new{
-            dimen      = Geom:new{ w = tab_w, h = M.SEP_H() },
-            background = _sepColor(),
-        }
-    end
-    vg[#vg + 1] = _lw_sep
-
-    -- Active indicator: black for the active tab, white (invisible) otherwise.
-    -- The active tab gets a fresh widget; inactive tabs share a singleton.
-    if active then
-        vg[#vg + 1] = LineWidget:new{
-            dimen      = Geom:new{ w = tab_w, h = M.INDIC_H() },
-            background = Blitbuffer.COLOR_BLACK,
-        }
-    else
-        if not _lw_indic_w then
-            _lw_indic_w = LineWidget:new{
-                dimen      = Geom:new{ w = tab_w, h = M.INDIC_H() },
-                background = Blitbuffer.COLOR_WHITE,
-            }
-        end
-        vg[#vg + 1] = _lw_indic_w
-    end
 
     if not _vspan_icon_top then _vspan_icon_top = VerticalSpan:new{ width = M.ICON_TOP_SP() } end
     vg[#vg + 1] = _vspan_icon_top
@@ -269,9 +241,26 @@ function M.buildTabCell(action_id, active, tab_w, mode)
         vg[#vg + 1] = VerticalSpan:new{ width = M.ICON_TOP_SP() + M.ICON_TXT_SP() }
     end
 
-    return CenterContainer:new{
+    -- The content (icon/label) is centred inside BAR_H.
+    local content = CenterContainer:new{
         dimen = Geom:new{ w = tab_w, h = M.BAR_H() },
         vg,
+    }
+
+    -- The active indicator is pinned to the very top of the cell via OverlapGroup,
+    -- independent of the vertical centering of the content.
+    local indic_color = active and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE
+    local indic = LineWidget:new{
+        dimen      = Geom:new{ w = tab_w, h = M.INDIC_H() },
+        background = indic_color,
+        overlap_offset = { 0, 0 },
+    }
+
+    return OverlapGroup:new{
+        allow_mirroring = false,
+        dimen           = Geom:new{ w = tab_w, h = M.BAR_H() },
+        content,
+        indic,
     }
 end
 
@@ -295,26 +284,10 @@ function M.buildNavpagerArrowCell(is_prev, enabled, tab_w, mode)
 
     local vg = VerticalGroup:new{ align = "center" }
 
-    -- Reuse the same separator and inactive-indicator singletons as buildTabCell.
-    -- Arrow cells never have an active indicator, so _lw_indic_w (white) is always correct.
-    if not _lw_sep then
-        _lw_sep = LineWidget:new{
-            dimen      = Geom:new{ w = tab_w, h = M.SEP_H() },
-            background = _sepColor(),
-        }
-    end
-    vg[#vg + 1] = _lw_sep
-    if not _lw_indic_w then
-        _lw_indic_w = LineWidget:new{
-            dimen      = Geom:new{ w = tab_w, h = M.INDIC_H() },
-            background = Blitbuffer.COLOR_WHITE,
-        }
-    end
-    vg[#vg + 1] = _lw_indic_w
     if not _vspan_icon_top then _vspan_icon_top = VerticalSpan:new{ width = M.ICON_TOP_SP() } end
     vg[#vg + 1] = _vspan_icon_top
 
-    -- References to mutable widgets stored on the CenterContainer so
+    -- References to mutable widgets stored on the OverlapGroup so
     -- updateNavpagerArrows can mutate them in-place without tree traversal.
     local iw, tw
 
@@ -348,16 +321,31 @@ function M.buildNavpagerArrowCell(is_prev, enabled, tab_w, mode)
         vg[#vg + 1] = VerticalSpan:new{ width = M.ICON_TOP_SP() + M.ICON_TXT_SP() }
     end
 
-    local cc = CenterContainer:new{
+    local content = CenterContainer:new{
         dimen = Geom:new{ w = tab_w, h = M.BAR_H() },
         vg,
     }
+
+    -- Arrow cells never have an active indicator; pin a white (invisible)
+    -- LineWidget to the top for visual consistency with buildTabCell.
+    local indic = LineWidget:new{
+        dimen          = Geom:new{ w = tab_w, h = M.INDIC_H() },
+        background     = Blitbuffer.COLOR_WHITE,
+        overlap_offset = { 0, 0 },
+    }
+
+    local og = OverlapGroup:new{
+        allow_mirroring = false,
+        dimen           = Geom:new{ w = tab_w, h = M.BAR_H() },
+        content,
+        indic,
+    }
     -- Annotate with mutable-widget handles and current enabled state.
     -- updateNavpagerArrows reads these directly — O(1), no tree traversal.
-    cc._arrow_image   = iw
-    cc._arrow_text    = tw
-    cc._arrow_enabled = enabled
-    return cc
+    og._arrow_image   = iw
+    og._arrow_text    = tw
+    og._arrow_enabled = enabled
+    return og
 end
 
 -- Updates the Prev/Next arrow cells of an existing navpager bar in-place.
@@ -1653,6 +1641,9 @@ function M.rewrapAllWidgets(plugin)
         end
 
         plugin:_registerTouchZones(w)
+        -- Resize the pagination chevrons to match Simple UI settings.
+        -- This is needed after rotation since onShow does not fire again.
+        M.resizePaginationButtons(w.file_chooser or w, M.getPaginationIconSize())
         UIManager:setDirty(w, "ui")  -- single setDirty — container is a child of w
     end
 
