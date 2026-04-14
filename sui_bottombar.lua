@@ -1671,8 +1671,15 @@ function M.restoreTabInFM(plugin, tabs, prev_action)
     -- and may be stale if the user changed tab config while the widget was open.
     local t = Config.loadTabConfig()
     local Patches = require("sui_patches")
-    local restored = (fm.file_chooser and Patches._resolveTabForPath(fm.file_chooser.path, t))
-                  or prev_action or (t[1])
+    -- Path-based resolution only makes sense for path-backed tabs ("home",
+    -- "custom_qa_*").  For non-path tabs (bookfusion, history, favorites,
+    -- homescreen, etc.) prev_action is authoritative — path resolution would
+    -- incorrectly match "home" when the FM happens to be at the home directory.
+    local path_resolved = nil
+    if not prev_action or prev_action == "home" or prev_action:match("^custom_qa_") then
+        path_resolved = fm.file_chooser and Patches._resolveTabForPath(fm.file_chooser.path, t)
+    end
+    local restored = path_resolved or prev_action or (t[1])
     plugin.active_action = restored
     M.replaceBar(fm, M.buildBarWidget(restored, t), t)
     UIManager:setDirty(fm, "ui")

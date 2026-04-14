@@ -296,17 +296,15 @@ function BookCoverThumb:update()
     if not self.entry.mandatory then
         local badge_pad   = Screen:scaleBySize(4)
         local badge_size  = Screen:scaleBySize(22)
-        local badge_inner = badge_size - 2 * border
         local badge = FrameContainer:new{
             background    = Blitbuffer.COLOR_WHITE,
             bordersize    = border,
             margin        = 0,
             padding       = 0,
-            radius        = math.floor(badge_size / 2),
             IconWidget:new{
                 icon  = "move.down",
-                width = badge_inner,
-                height = badge_inner,
+                width = badge_size - 2 * border,
+                height = badge_size - 2 * border,
             },
         }
         badge.overlap_offset = {
@@ -1080,7 +1078,30 @@ function M.show()
         return
     end
 
-    if M._instance then return end
+    -- Guard against double-show — but verify the old instance is still
+    -- alive AND visible on the widget stack.  When the reader closes, the
+    -- FM is recreated on top of the old BookFusion menu, burying it.  In
+    -- that case we must close the stale menu and create a fresh one.
+    if M._instance then
+        local dominated = false  -- true if a fullscreen widget sits above us
+        local found     = false
+        local UI = require("sui_core")
+        pcall(function()
+            for _, entry in ipairs(UI.getWindowStack()) do
+                if entry.widget == M._instance then
+                    found = true
+                elseif found and entry.widget and entry.widget.covers_fullscreen then
+                    dominated = true
+                end
+            end
+        end)
+        if found and not dominated then return end
+        -- Stale or buried — close the old menu and create a fresh one.
+        if found then
+            pcall(function() UIManager:close(M._instance) end)
+        end
+        M._instance = nil
+    end
 
     local Menu = require("ui/widget/menu")
     local PageMenu = Menu:extend{}
@@ -1124,7 +1145,7 @@ function M.show()
 
     -- Fetches a single book list from the API and saves it to the disk cache.
     -- Returns the raw data array, or nil on failure.
-    local function syncList(list_filter, cache_key, fetch_progress)
+    local function syncList(list_filter, cache_key)
         local params = { page = 1, per_page = 50 }
         if list_filter then
             params.list = list_filter
@@ -1133,16 +1154,6 @@ function M.show()
         local ok, data = api:searchBooks(params)
         if not ok then return nil end
         data = data or {}
-        if fetch_progress then
-            for _, book in ipairs(data) do
-                if book.id then
-                    local p_ok, pos = api:getReadingPosition(book.id)
-                    if p_ok and pos and pos.percentage then
-                        book.cloud_percent = pos.percentage / 100
-                    end
-                end
-            end
-        end
         _saveCachedList(cache_key, data)
         return data
     end
@@ -1156,33 +1167,55 @@ function M.show()
         UIManager:show(notice)
         UIManager:scheduleIn(0.05, function()
             NetworkMgr:runWhenOnline(function()
-                -- Sync all cached lists.
-                local cr_data = syncList("currently_reading", "books", true)
-                syncList("planned_to_read", "planned_to_read", false)
-                syncList("favorites", "favorites", false)
-
-                UIManager:close(notice)
-                syncing = false
-
+                -- 1. Fetch currently-reading list.
+                local cr_data = syncList("currently_reading", "books")
                 if cr_data == nil then
+                    UIManager:close(notice)
+                    syncing = false
                     _showInfo(_("Sync failed."))
                     return
                 end
 
+                -- 2. Show books immediately (progress bars update later).
                 if M._instance == menu then
                     menu._books      = _buildBookEntries(bf, settings, cr_data, true)
                     menu._strip_page = 1
+                    menu:updateItems()
+                end
 
-                    -- If the user is viewing a cached folder, refresh it too.
-                    if menu._view == "folder" and menu._folder_cache_key then
-                        local fresh = _loadCachedList(menu._folder_cache_key)
-                        if fresh then
-                            menu._folder_raw_books = fresh
-                            menu._folder_books     = _buildBookEntries(bf, settings, fresh, false)
-                            menu._folder_total     = #fresh
+                -- 3. Fetch other lists.
+                syncList("planned_to_read", "planned_to_read")
+                syncList("favorites", "favorites")
+
+                if M._instance == menu and menu._view == "folder" and menu._folder_cache_key then
+                    local fresh = _loadCachedList(menu._folder_cache_key)
+                    if fresh then
+                        menu._folder_raw_books = fresh
+                        menu._folder_books     = _buildBookEntries(bf, settings, fresh, false)
+                        menu._folder_total     = #fresh
+                        menu:updateItems()
+                    end
+                end
+
+                -- 4. Fetch cloud reading progress for every currently-reading book.
+                for _, book in ipairs(cr_data) do
+                    if book.id then
+                        local p_ok, pos = api:getReadingPosition(book.id)
+                        if p_ok and pos and pos.percentage then
+                            book.cloud_percent = pos.percentage / 100
                         end
                     end
+                end
 
+                -- Save with progress to cache.
+                _saveCachedList("books", cr_data)
+
+                -- 5. Final UI refresh with progress bars.
+                UIManager:close(notice)
+                syncing = false
+
+                if M._instance == menu then
+                    menu._books = _buildBookEntries(bf, settings, cr_data, true)
                     menu:updateItems()
                 end
             end)
@@ -1306,16 +1339,43 @@ function M.show()
     -- (Menu's default close_callback would otherwise commandeer right_icon
     -- with a "close" button — see TitleBar:init line 87). The bottom navbar
     -- handles tab switching, so we don't need an explicit close button here.
+    -- Match the library tab's title bar geometry: icon size, padding,
+    -- hitbox, and title position so everything lines up identically.
+    local tb_btn_pad = Screen:scaleBySize(5)   -- same as FM title bar
+    local tb_side_pad = Screen:scaleBySize(18)  -- same as sui_titlebar _buttonX pad
     local title_bar = TitleBar:new{
         width                   = Screen:getWidth(),
         fullscreen              = "true",
         align                   = "center",
         title                   = _("BookFusion"),
+        title_top_padding       = Screen:scaleBySize(6),
+        button_padding          = tb_btn_pad,
         left_icon               = "appbar.search",
+        left_icon_size_ratio    = 1,
         left_icon_tap_callback  = doSearch,
         right_icon              = "cre.render.reload",
+        right_icon_size_ratio   = 1,
         right_icon_tap_callback = doSync,
     }
+    -- Strip the oversized hitbox that TitleBar adds by default
+    -- (padding_right = 2*icon, padding_bottom = icon) and reposition
+    -- buttons with overlap_offset so they sit at the same distance
+    -- from the screen edge as the library tab buttons.
+    local icon_w = Screen:scaleBySize(40)  -- 40 * ratio(1)
+    if title_bar.left_button then
+        title_bar.left_button.padding_right  = 0
+        title_bar.left_button.padding_bottom = 0
+        title_bar.left_button.overlap_align  = nil
+        title_bar.left_button.overlap_offset = { tb_side_pad, 0 }
+        title_bar.left_button:update()
+    end
+    if title_bar.right_button then
+        title_bar.right_button.padding_left   = 0
+        title_bar.right_button.padding_bottom = 0
+        title_bar.right_button.overlap_align  = nil
+        title_bar.right_button.overlap_offset = { Screen:getWidth() - icon_w - tb_side_pad, 0 }
+        title_bar.right_button:update()
+    end
 
     menu = PageMenu:new{
         name              = "bookfusion",
@@ -1336,13 +1396,6 @@ function M.show()
                     local download_dir = Downloader.getDownloadDir(settings)
                     local filename = Downloader.buildFilename(item.book)
                     local filepath = download_dir .. "/" .. filename
-                    local function _refresh()
-                        UIManager:scheduleIn(0.1, function()
-                            if not menu then return end
-                            menu:updateItems()
-                            UIManager:setDirty("all", "full")
-                        end)
-                    end
                     if Downloader.fileExists(filepath) then
                         -- Book is downloaded — show read/remove dialog
                         local ButtonDialog = require("ui/widget/buttondialog")
@@ -1365,7 +1418,11 @@ function M.show()
                                         ok_text = _("Remove"),
                                         ok_callback = function()
                                             os.remove(filepath)
-                                            _refresh()
+                                            -- Update entry directly so the badge
+                                            -- refreshes regardless of which list
+                                            -- the entry belongs to.
+                                            item.mandatory = nil
+                                            if menu then menu:updateItems() end
                                         end,
                                     })
                                 end }},
@@ -1373,8 +1430,16 @@ function M.show()
                         }
                         UIManager:show(bdialog)
                     else
-                        -- Book not downloaded — offer to download
-                        Downloader.confirmDownload(api, settings, item.book, _refresh)
+                        -- Book not downloaded — offer to download.
+                        -- Update the entry directly and rebuild the menu
+                        -- synchronously. The downloader's success InfoMessage
+                        -- appears on top, but the updated menu is already
+                        -- underneath and revealed when it closes.
+                        local function _onDownloaded()
+                            item.mandatory = _("Downloaded")
+                            if menu then menu:updateItems() end
+                        end
+                        Downloader.confirmDownload(api, settings, item.book, _onDownloaded)
                     end
                 elseif item.folder then
                     openFolderInline(item.folder)
