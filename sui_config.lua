@@ -622,7 +622,7 @@ function M.applyFirstRunDefaults()
         G_reader_settings:saveSetting("navbar_mode",           "both")
         G_reader_settings:saveSetting("navbar_bar_size",       "default")
         G_reader_settings:saveSetting("navbar_tabs",
-            { "home", "homescreen", "history", "continue", "power" })
+            { "home", "bookfusion", "homescreen", "history", "continue", "power" })
 
         -- Top bar: clock left, battery + wifi right; rest hidden
         M.saveTopbarConfig({
