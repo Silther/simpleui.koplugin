@@ -1493,14 +1493,14 @@ SimpleUIPlugin.addToMainMenu = function(self, menu_items)
                                 local current_pages = G_reader_settings:readSetting(ctx.pfx .. "homescreen_num_pages")
                                     or math.max(1, saved_breaks + 1)
                                 UIManager:show(SpinWidget:new{
-                                    title_text    = T("Number of Pages"),
-                                    info_text     = T("Choose how many pages the homescreen has.\nEmpty pages stay empty. Modules keep their position."),
+                                    title_text    = _("Number of Pages"),
+                                    info_text     = _("Choose how many pages the homescreen has.\nEmpty pages stay empty. Modules keep their position."),
                                     value         = current_pages,
                                     value_min     = 1,
                                     value_max     = 10,
                                     value_step    = 1,
-                                    ok_text       = T("OK"),
-                                    cancel_text   = T("Cancel"),
+                                    ok_text       = _("OK"),
+                                    cancel_text   = _("Cancel"),
                                     default_value = 1,
                                     callback = function(spin)
                                         local new_pages = spin.value
@@ -1598,7 +1598,7 @@ SimpleUIPlugin.addToMainMenu = function(self, menu_items)
 
                                 if #enabled_ids < 2 then
                                     UIManager:show(InfoMessage():new{
-                                        text = T("Enable at least 2 modules to arrange."), timeout = 2 })
+                                        text = _("Enable at least 2 modules to arrange."), timeout = 2 })
                                     return
                                 end
 
@@ -1620,7 +1620,7 @@ SimpleUIPlugin.addToMainMenu = function(self, menu_items)
                                             if current_breaks < n_pgs - 1 then
                                                 current_breaks = current_breaks + 1
                                                 items[#items + 1] = {
-                                                    text      = "── " .. string.format(T("Page %d"), current_breaks + 1) .. " ──",
+                                                    text      = "── " .. string.format(_("Page %d"), current_breaks + 1) .. " ──",
                                                     orig_item = PAGE_BREAK,
                                                     _is_break = true,
                                                     dim       = true,
@@ -1640,7 +1640,7 @@ SimpleUIPlugin.addToMainMenu = function(self, menu_items)
                                     while current_breaks < n_pgs - 1 do
                                         current_breaks = current_breaks + 1
                                         items[#items + 1] = {
-                                            text      = "── " .. string.format(T("Page %d"), current_breaks + 1) .. " ──",
+                                            text      = "── " .. string.format(_("Page %d"), current_breaks + 1) .. " ──",
                                             orig_item = PAGE_BREAK,
                                             _is_break = true,
                                             dim       = true,
@@ -1651,14 +1651,14 @@ SimpleUIPlugin.addToMainMenu = function(self, menu_items)
 
                                 local function validate(items)
                                     if items[1] and items[1]._is_break then
-                                        return false, T("Cannot place modules after Page 1 separator.\nPage 1 must always have at least 1 module.")
+                                        return false, _("Cannot place modules after Page 1 separator.\nPage 1 must always have at least 1 module.")
                                     end
                                     local has_mod = false
                                     for _i, it in ipairs(items) do
                                         if not it._is_break then has_mod = true; break end
                                     end
                                     if not has_mod then
-                                        return false, T("Enable at least 2 modules to arrange.")
+                                        return false, _("Enable at least 2 modules to arrange.")
                                     end
                                     return true
                                 end
@@ -1695,7 +1695,7 @@ SimpleUIPlugin.addToMainMenu = function(self, menu_items)
 
                                 local sort_items = buildSortItems(n_pages)
                                 UIManager:show(SortWidget():new{
-                                    title             = T("Arrange Modules"),
+                                    title             = _("Arrange Modules"),
                                     item_table        = sort_items,
                                     covers_fullscreen = true,
                                     callback          = function() saveOrder(sort_items) end,
