@@ -162,6 +162,9 @@ end
 
 -- Promotes a book entry's cached cover (disk -> in-memory blitbuffer).
 local function _hydrateEntryCover(entry)
+    -- Fast path: already decoded into a live blitbuffer — reuse across
+    -- page turns instead of freeing and re-decoding each render.
+    if entry.has_cover and entry.cover_bb then return end
     if entry.cover_bb then
         entry.cover_bb:free()
         entry.cover_bb = nil
@@ -227,6 +230,56 @@ end
 -- Forward declaration — defined after _buildCoverRows so it can be referenced.
 local BookCoverThumb
 
+-- Cheap "is this cover already on disk?" check. Lets us decide whether to
+-- hydrate locally (fast) or queue a URL fetch (network). lfs.attributes with
+-- "mode" is a single stat syscall — no file read.
+local _lfs
+local function _isInDiskCache(cover_url)
+    if not cover_url then return false end
+    if not _lfs then _lfs = require("libs/libkoreader-lfs") end
+    if not CoverCache then CoverCache = require("bf_covercache") end
+    return _lfs.attributes(CoverCache.path(cover_url), "mode") == "file"
+end
+
+-- Hydrates queued thumbs' covers one-at-a-time on the event loop so a page
+-- turn can paint its placeholders immediately and covers pop in afterward.
+-- Each menu:updateItems() bumps a generation; any in-flight step whose gen
+-- no longer matches aborts, so rapid page flips don't stack up.
+local function _kickAsyncHydration(menu)
+    local pending = menu._pending_cover_hydration
+    menu._pending_cover_hydration = nil
+    if not pending or #pending == 0 then return end
+
+    menu._hydration_gen = (menu._hydration_gen or 0) + 1
+    local gen = menu._hydration_gen
+    local i = 1
+
+    local function step()
+        if menu._hydration_gen ~= gen then return end
+        if menu._view ~= "folder" then return end
+        if i > #pending then return end
+
+        local thumb = pending[i]
+        i = i + 1
+        if thumb and thumb.entry then
+            local entry = thumb.entry
+            if not (entry.has_cover and entry.cover_bb) then
+                _hydrateEntryCover(entry)
+                if entry.has_cover and entry.cover_bb then
+                    thumb:update()
+                    if thumb[1] and thumb[1].dimen then
+                        UIManager:setDirty(menu.show_parent, function()
+                            return "ui", thumb[1].dimen
+                        end)
+                    end
+                end
+            end
+        end
+        UIManager:nextTick(step)
+    end
+    UIManager:nextTick(step)
+end
+
 -- Builds a navigation arrow (enabled = tappable IconButton, disabled = spacer).
 local function _buildArrow(icon, size, pad, enabled, callback, show_parent)
     if enabled then
@@ -274,7 +327,13 @@ local function _buildCoverRows(params)
         for c = 1, cols do
             if idx > end_idx then break end
             local entry = entries[idx]
-            _hydrateEntryCover(entry)
+            -- NOTE: we no longer call _hydrateEntryCover(entry) here. Decoding
+            -- covers synchronously during the page build is what made page
+            -- turns feel slow. Instead, thumbs render a placeholder if the
+            -- entry isn't already hydrated in memory, and we queue them for
+            -- async hydration (disk read + decode) after the page paints, or
+            -- for a URL fetch (via covermenu's items_to_update loader) when
+            -- the cover isn't cached on disk yet.
             local thumb = BookCoverThumb:new{
                 entry       = entry,
                 menu        = menu,
@@ -286,8 +345,18 @@ local function _buildCoverRows(params)
             }
             table.insert(row_hg, thumb)
             table.insert(row_layout, thumb)
-            if entry.lazy_load_cover or (entry.cover_url and not entry.has_cover) then
-                table.insert(items_to_update, thumb)
+            local has_live_cover = entry.has_cover and entry.cover_bb
+            if not has_live_cover then
+                if entry.cover_data or _isInDiskCache(entry.cover_url) then
+                    -- Bytes already local — async decode on the event loop.
+                    if menu._pending_cover_hydration then
+                        table.insert(menu._pending_cover_hydration, thumb)
+                    end
+                elseif entry.cover_url then
+                    -- Cache miss: covermenu's URL fetcher will pick it up.
+                    entry.lazy_load_cover = true
+                    table.insert(items_to_update, thumb)
+                end
             end
             if c < cols and idx < end_idx then
                 table.insert(row_hg, HorizontalSpan:new{ width = cell_pad })
@@ -362,12 +431,19 @@ end
 -- ---------------------------------------------------------------------------
 
 -- In-place update of download status and progress on existing entries.
-local function _refreshDownloadStatus(entries, bf, settings, with_progress)
+-- Pass first/last to limit the refresh to a slice (e.g. just the visible
+-- grid page); defaults to the whole list.
+local function _refreshDownloadStatus(entries, bf, settings, with_progress, first, last)
     if not entries then return end
+    local n = #entries
+    if n == 0 then return end
+    first = math.max(1, first or 1)
+    last  = math.min(n, last or n)
     local Downloader   = bf.downloader
     local download_dir = Downloader.getDownloadDir(settings)
-    for _i, entry in ipairs(entries) do
-        if entry.book then
+    for i = first, last do
+        local entry = entries[i]
+        if entry and entry.book then
             local filepath = download_dir .. "/" .. Downloader.buildFilename(entry.book)
             if Downloader.fileExists(filepath) then
                 entry.mandatory = _("Downloaded")
@@ -476,9 +552,15 @@ function BookCoverThumb:update()
         local img_w = entry.cover_w or entry.cover_bb:getWidth()
         local img_h = entry.cover_h or entry.cover_bb:getHeight()
         local scale_factor = _coverScale(img_w, img_h, img_max_w, img_max_h)
+        -- image_disposable = false: we own entry.cover_bb and reuse it across
+        -- renders. Without this, ImageWidget's _render() calls scaleBlitBuffer
+        -- with free_orig_bb = nil (~= false), which frees our source bb.
+        -- The entry's cover_bb is then a dangling pointer; my early-return in
+        -- _hydrateEntryCover would reuse it on the next render → crash.
         local wimage = ImageWidget:new{
-            image        = entry.cover_bb,
-            scale_factor = scale_factor,
+            image             = entry.cover_bb,
+            image_disposable  = false,
+            scale_factor      = scale_factor,
         }
         wimage:_render()
         local sz = wimage:getSize()
@@ -526,6 +608,7 @@ function BookCoverThumb:update()
     -- Free unused cover_bb.
     if entry.cover_bb and not cover_bb_used then
         entry.cover_bb:free()
+        entry.cover_bb = nil
     end
 
     -- Not-downloaded badge: small framed down-arrow in the bottom-right corner.
@@ -684,9 +767,14 @@ end
 
 function BackRow:onTapSelect()
     if self.menu then
-        self.menu._view = "home"
-        self.menu._folder_grid_page = 1
-        self.menu:updateItems()
+        local m = self.menu
+        local key = m._folder_current_key
+        if key and m._folder_grid_page_by_key then
+            m._folder_grid_page_by_key[key] = m._folder_grid_page
+        end
+        m._view = "home"
+        m._folder_grid_page = 1
+        m:updateItems()
     end
     return true
 end
@@ -824,6 +912,11 @@ local function _buildFolderViewUI(self)
     local page, total_pages, first_idx, last_idx = _paginateIndex(n, per_page, self._folder_grid_page)
     self._folder_grid_page = page
 
+    -- Fresh queue for this render. _buildCoverRows appends thumbs that need
+    -- an async local hydrate (disk-cached bytes → blitbuffer); menu.updateItems
+    -- drains it after the page paints.
+    self._pending_cover_hydration = {}
+
     table.insert(vg, VerticalSpan:new{ width = Screen:scaleBySize(4) })
 
     -- Build cover rows.
@@ -847,6 +940,14 @@ local function _buildFolderViewUI(self)
 
     -- Bottom navigation.
     local has_more_api = self._folder_total and n < self._folder_total
+    -- Watermark prefetch: fire a silent fetch whenever the user is within
+    -- one local page of the tail and the server has more. Without this,
+    -- prefetch only happens on the user's next-tap, so fast consecutive
+    -- turns can still block.
+    if has_more_api and not self._folder_fetching
+            and (total_pages - page) <= 1 and self._fetchFolderPage then
+        self._fetchFolderPage({ silent = true })
+    end
     local arrow_size = Screen:scaleBySize(40)
     local nav_hg, left_arrow, right_arrow = _buildPageNav{
         page        = page,
@@ -865,11 +966,34 @@ local function _buildFolderViewUI(self)
         end,
         on_next = function()
             if page < total_pages then
+                -- Data already loaded locally — advance immediately.
                 self._folder_grid_page = page + 1
                 self:updateItems()
-                if self._fetchFolderPage then self._fetchFolderPage({ silent = true }) end
-            elseif has_more_api and self._loadMoreFolderBooks then
-                self._loadMoreFolderBooks()
+                -- Prefetch next API batch in the background so the NEXT
+                -- page turn is also instant.
+                if self._fetchFolderPage then
+                    self._fetchFolderPage({ silent = true })
+                end
+            elseif has_more_api and self._fetchFolderPage then
+                -- On the last locally-loaded page but more exist on the
+                -- server. Fetch the next batch and advance when it arrives.
+                -- Show a transient "Loading…" indicator so the user knows
+                -- the page turn is waiting on the network. A timeout is
+                -- set as a safety net in case _fetchFolderPage short-
+                -- circuits (e.g. concurrent fetch in flight) and never
+                -- calls our on_done.
+                local InfoMessage = require("ui/widget/infomessage")
+                local loading = InfoMessage:new{ text = _("Loading…"), timeout = 10 }
+                UIManager:show(loading)
+                self._fetchFolderPage({
+                    on_done = function()
+                        UIManager:close(loading)
+                        if self._view == "folder" then
+                            self._folder_grid_page = page + 1
+                            self:updateItems()
+                        end
+                    end,
+                })
             end
         end,
     }
@@ -1247,7 +1371,15 @@ function M.show()
         menu._folder_filters    = folder.filters
         menu._folder_cache_key  = folder.cache_key
         menu._folder_query      = folder.query
-        menu._folder_grid_page  = 1
+
+        -- Remember the user's last grid page for this folder/query so
+        -- re-opening resumes where they left off (within the session).
+        local key = folder.cache_key
+            or (folder.query and folder.query ~= "" and ("search:" .. folder.query))
+            or nil
+        menu._folder_current_key = key
+        menu._folder_grid_page_by_key = menu._folder_grid_page_by_key or {}
+        menu._folder_grid_page = (key and menu._folder_grid_page_by_key[key]) or 1
 
         if folder.cache_key then
             local cached = _loadCachedList(folder.cache_key)
@@ -1265,8 +1397,11 @@ function M.show()
         menu._folder_raw_books = {}
         menu._folder_api_page  = 0
         menu._folder_total     = nil
+        menu._folder_fetching  = nil
         menu:updateItems()
-        menu._fetchFolderPage()
+        -- Load one API page; _fetchOne renders per batch and the watermark
+        -- prefetch in _buildFolderViewUI keeps the buffer warm.
+        menu._fetchFolderPage({ count = 1 })
     end
 
     -- Fetches a single book list from the API and caches it.
@@ -1376,72 +1511,116 @@ function M.show()
         dialog:onShowKeyboard()
     end
 
-    -- Fetches the next page of books for the current folder view.
+    -- Fetches the next API page of books for the current folder view.
+    --
+    -- opts.silent   = true: background prefetch — no error messages, no UI
+    --                 update, just appends data for the next page turn.
+    -- opts.on_done  = optional callback after a successful fetch.
+    -- opts.count    = fetch N API pages in a row (default 1). Used for the
+    --                 initial load (count=2) so pages 1+2 are ready.
+    --
+    -- Read-ahead strategy:
+    --   openFolderInline → fetchFolderPage({ count = 2 })  (loads pages 1+2)
+    --   on_next          → advance grid page, then
+    --                      fetchFolderPage({ silent = true })  (prefetch next)
+    --   The grid never blocks unless the user outruns the prefetcher.
     local function fetchFolderPage(opts)
         opts = opts or {}
-        if opts.silent then
-            if not menu or menu._view ~= "folder" then return end
-            if menu._folder_prefetching then return end
-            local n     = menu._folder_books and #menu._folder_books or 0
-            local total = menu._folder_total or n
-            if n >= total then return end
-            local grid_pp = menu._folder_grid_per_page or 8
-            if (menu._folder_grid_page or 1) < math.ceil(n / grid_pp) then return end
-            menu._folder_prefetching = true
+
+        -- Guard: nothing to do if we already have everything.
+        if menu._folder_total then
+            local n = menu._folder_raw_books and #menu._folder_raw_books or 0
+            if n >= menu._folder_total then return end
         end
+
+        -- Prevent concurrent fetches.
+        if menu._folder_fetching then return end
+        menu._folder_fetching = true
+
+        local remaining = opts.count or 1
+
         local NetworkMgr = require("ui/network/manager")
         NetworkMgr:runWhenOnline(function()
             UIManager:scheduleIn(0.05, function()
-                if opts.silent and (not menu or menu._view ~= "folder") then
-                    menu._folder_prefetching = nil
+                -- Bail if the folder view was closed while we waited.
+                if not menu or menu._view ~= "folder" then
+                    menu._folder_fetching = nil
                     return
                 end
-                local grid_pp = menu._folder_grid_per_page or 8
-                local params = {
-                    page     = (menu._folder_api_page or 0) + 1,
-                    per_page = grid_pp * 2,
-                }
-                for k, v in pairs(menu._folder_filters or {}) do
-                    params[k] = v
-                end
-                if menu._folder_query and menu._folder_query ~= "" then
-                    params.query = menu._folder_query
-                end
-                if not params.sort then params.sort = "added_at-desc" end
 
-                local ok, data, pagination = api:searchBooks(params)
-                if opts.silent then menu._folder_prefetching = nil end
-                if not ok then
-                    if not opts.silent then
-                        _showInfo(_("Failed to load books."))
-                        if menu._folder_books == nil then
-                            menu._folder_books = {}
-                            if M._instance == menu then menu:updateItems() end
+                local function _fetchOne(on_batch_done)
+                    local grid_pp = menu._folder_grid_per_page or 8
+                    local params = {
+                        page     = (menu._folder_api_page or 0) + 1,
+                        per_page = grid_pp * 2,
+                    }
+                    for k, v in pairs(menu._folder_filters or {}) do
+                        params[k] = v
+                    end
+                    local has_query = menu._folder_query and menu._folder_query ~= ""
+                    if has_query then
+                        params.query = menu._folder_query
+                    end
+                    -- For text queries let the server rank by relevance;
+                    -- only force the list ordering when browsing a folder.
+                    if not params.sort and not has_query then
+                        params.sort = "added_at-desc"
+                    end
+
+                    local ok, data, pagination = api:searchBooks(params)
+                    if not ok then
+                        if not opts.silent then
+                            _showInfo(_("Failed to load books."))
+                            if menu._folder_books == nil then
+                                menu._folder_books = {}
+                            end
                         end
+                        on_batch_done(true)  -- stop looping
+                        return
                     end
-                    return
+
+                    if pagination then
+                        menu._folder_api_page = pagination.page or ((menu._folder_api_page or 0) + 1)
+                        menu._folder_total    = pagination.total
+                    else
+                        menu._folder_api_page = (menu._folder_api_page or 0) + 1
+                    end
+
+                    -- Incremental build: only build entries for the new
+                    -- batch and append them, instead of rebuilding the
+                    -- full list each fetch (was O(n) per batch).
+                    local new_entries = _buildBookEntries(bf, settings, data or {}, false)
+                    for _i, book in ipairs(data or {}) do
+                        table.insert(menu._folder_raw_books, book)
+                    end
+                    menu._folder_books = menu._folder_books or {}
+                    for _i, entry in ipairs(new_entries or {}) do
+                        table.insert(menu._folder_books, entry)
+                    end
+
+                    -- Are there more API pages to fetch?
+                    local all_loaded = menu._folder_total
+                        and #menu._folder_raw_books >= menu._folder_total
+                    on_batch_done(all_loaded)
                 end
 
-                if pagination then
-                    menu._folder_api_page = pagination.page or ((menu._folder_api_page or 0) + 1)
-                    menu._folder_total    = pagination.total
-                else
-                    menu._folder_api_page = (menu._folder_api_page or 0) + 1
+                -- Fetch `remaining` API pages sequentially.
+                local function _loop()
+                    _fetchOne(function(done)
+                        remaining = remaining - 1
+                        if done or remaining <= 0 or menu._view ~= "folder" then
+                            menu._folder_fetching = nil
+                            -- Refresh UI after all batches complete.
+                            if M._instance == menu and menu._view == "folder" then
+                                menu:updateItems()
+                            end
+                            if opts.on_done then opts.on_done() end
+                        else
+                            _loop()
+                        end
+                    end)
                 end
-                for _, book in ipairs(data or {}) do
-                    table.insert(menu._folder_raw_books, book)
-                end
-                menu._folder_books = _buildBookEntries(bf, settings, menu._folder_raw_books, false)
-
-                if opts.advance_from then
-                    local new_n = #menu._folder_books
-                    if new_n > opts.advance_from and grid_pp > 0 then
-                        menu._folder_grid_page = math.floor(opts.advance_from / grid_pp) + 1
-                    end
-                end
-                if not opts.silent and M._instance == menu and menu._view == "folder" then
-                    menu:updateItems()
-                end
+                _loop()
             end)
         end)
     end
@@ -1474,8 +1653,23 @@ function M.show()
     -- Wire up custom layout using bf_covermenu's updateItems for lazy cover loading.
     local _base_updateItems = bf.covermenu.updateItems
     menu.updateItems = function(self_menu, ...)
-        pcall(_refreshDownloadStatus, self_menu._books, bf, settings, true)
-        pcall(_refreshDownloadStatus, self_menu._folder_books, bf, settings, false)
+        -- Only refresh the list that's actually on screen — the non-visible
+        -- list hasn't changed and re-stat'ing its files on every page turn
+        -- is wasted work. Within the folder view, further restrict to the
+        -- visible grid slice so the file-stat loop doesn't walk hundreds
+        -- of off-screen entries on every turn.
+        if self_menu._view == "folder" then
+            local entries = self_menu._folder_books
+            if entries and #entries > 0 then
+                local pp = self_menu._folder_grid_per_page or #entries
+                local p  = self_menu._folder_grid_page or 1
+                local first = (p - 1) * pp + 1
+                local last  = first + pp - 1
+                pcall(_refreshDownloadStatus, entries, bf, settings, false, first, last)
+            end
+        else
+            pcall(_refreshDownloadStatus, self_menu._books, bf, settings, true)
+        end
         _base_updateItems(self_menu, ...)
         UIManager:setDirty(self_menu.show_parent, function()
             return "ui", Geom:new{
@@ -1485,6 +1679,11 @@ function M.show()
                 h = UI.getContentHeight(),
             }
         end)
+        -- Page has painted — drain the async cover hydration queue. Visible
+        -- thumbs that had cached bytes on disk will pop in progressively.
+        if self_menu._view == "folder" then
+            _kickAsyncHydration(self_menu)
+        end
     end
     menu.onCloseWidget = function(self_w)
         M._instance = nil
