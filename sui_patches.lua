@@ -1285,6 +1285,8 @@ function M.patchUIManagerShow(plugin)
             effective_action = Bottombar.setActiveAndRefreshFM(plugin, "history", tabs)
         elseif widget.name == "homescreen" and tabs_set["homescreen"] then
             effective_action = Bottombar.setActiveAndRefreshFM(plugin, "homescreen", tabs)
+        elseif widget.name == "bookfusion" and tabs_set["bookfusion"] then
+            effective_action = Bottombar.setActiveAndRefreshFM(plugin, "bookfusion", tabs)
         elseif widget.name == "coll_list"
                or (widget.name == "collections" and not Config.isFavoritesWidget(widget)) then
             if tabs_set["collections"] then

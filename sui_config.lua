@@ -88,6 +88,7 @@ M.ICON = {
     plugin         = _P .. "plugin.svg",
     author         = _P .. "author.svg",
     series         = _P .. "series.svg",
+    bookfusion     = _P .. "bookfusion.svg",
 
     -- Navpager arrow icons (KOReader built-ins)
     nav_prev       = _KO .. "chevron.left.svg",
@@ -145,6 +146,7 @@ M.ALL_ACTIONS = {
       browsemeta_mode = "author" },
     { id = "browse_series",    label = _("Series"),           icon = M.ICON.series,
       browsemeta_mode = "series" },
+    { id = "bookfusion",       label = _("BookFusion"),       icon = M.ICON.bookfusion  },
 }
 
 -- Fast lookup map keyed by action ID.

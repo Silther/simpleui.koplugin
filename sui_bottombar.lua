@@ -1428,6 +1428,17 @@ function M.navigate(plugin, action_id, fm_self, tabs, force)
         end
         return
 
+    elseif action_id == "bookfusion" then
+        local ok_bf, BF = pcall(require, "sui_bookfusion")
+        if ok_bf and BF and type(BF.show) == "function" then
+            local on_qa_tap = function(aid)
+                plugin:_navigate(aid, plugin.ui, Config.loadTabConfig(), false)
+            end
+            BF.show(on_qa_tap)
+        else
+            showUnavailable(_("BookFusion tab not available."))
+        end
+
     else
         if action_id:match("^custom_qa_%d+$") then
             -- dispatcher_action and plugin_method are handled by _executeInPlace
