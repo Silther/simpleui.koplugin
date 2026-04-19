@@ -1,6 +1,6 @@
 -- sui_bookfusion.lua — Simple UI / BookFusion tab
 -- Native-feeling fullscreen widget that surfaces the user's BookFusion library
--- (Currently Reading carousel, To Be Read & Favorites grid subpages) without
+-- (Currently Reading carousel, Plan to Read & Favorites grid subpages) without
 -- duplicating any logic from bookfusion.koplugin — it calls the live BF plugin
 -- instance registered on the FileManager under `fm.bookfusion`.
 --
@@ -20,7 +20,7 @@
 --     thanks to `name = "bookfusion"` being in sui_patches' INJECT_NAMES.
 --   • Landing page: header, "Currently Reading" carousel (N-per-page with
 --     left/right arrows; full row centred, partial last row left-aligned),
---     "To Be Read" and "Favorites" buttons.
+--     "Plan to Read" and "Favorites" buttons.
 --   • Subpages (TBR / Favorites): grid of cover+title tiles with pagination.
 --   • All sizes flow from four scale/count settings so a future settings
 --     panel can expose them without touching this file's layout code.
@@ -237,12 +237,45 @@ function Data.startLink()
     return ok
 end
 
+-- Open the BookFusion plugin's native browser popup.
+--
+-- We build the Browser ourselves instead of calling `p:onSearchBooks()`:
+-- the BF plugin's method constructs a fresh `Browser` local to the
+-- function and drops the reference on return, relying on Lua's GC to keep
+-- the instance alive via the closures captured inside `browser._menu`.
+-- That worked fine for BF's own tools-menu entry (the tools menu closes
+-- before the browser opens, so there are no live competing widgets) but
+-- reliably dropped the popup when invoked from inside our BookFusionTab's
+-- button callback — the browser was getting collected before its menu
+-- could paint.  Holding the Browser on our module upvalue fixes it and
+-- still cleans up on next open (or when the user closes our tab) because
+-- the close_callback nils self._menu / we overwrite the reference here.
+local _bf_browser_instance = nil
 function Data.openBrowser()
     local p = Data.getPlugin()
-    if not p or type(p.onSearchBooks) ~= "function" then return false end
-    local ok, err = pcall(function() p:onSearchBooks() end)
-    if not ok then logger.warn("simpleui-bf: openBrowser failed:", tostring(err)) end
-    return ok
+    if not p or not p.api or not p.bf_settings then return false end
+    local ok_req, Browser = pcall(require, "bf_browser")
+    if not ok_req or not Browser then
+        logger.warn("simpleui-bf: bf_browser not reachable")
+        return false
+    end
+    -- Deferred by one UI tick so the button's flash/unhighlight refresh
+    -- finishes before the popup's setDirty lands in the queue.
+    UIManager:scheduleIn(0, function()
+        local ok, err = pcall(function()
+            _bf_browser_instance = Browser:new(p.api, p.bf_settings)
+            _bf_browser_instance:show()
+        end)
+        if not ok then
+            logger.warn("simpleui-bf: openBrowser failed:", tostring(err))
+            local InfoMessage = require("ui/widget/infomessage")
+            UIManager:show(InfoMessage:new{
+                text = "BookFusion browse error:\n" .. tostring(err),
+                timeout = 5,
+            })
+        end
+    end)
+    return true
 end
 
 -- Instantiate a throwaway Browser with the live api+settings so its
@@ -703,7 +736,7 @@ function BookFusionTab:_buildTitleBar()
         left_icon = "appbar.search"
         left_cb   = function() self:_onLeftIcon() end
     elseif self._view == "tbr" then
-        title     = _("To Be Read")
+        title     = _("Plan to Read")
         left_icon = "chevron.left"
         left_cb   = function() self:_exitSubpage() end
     else
@@ -806,8 +839,8 @@ function BookFusionTab:_buildLanding(sw, content_h)
 
     -- Section label — bold + small + mid-gray.  Small enough not to compete
     -- with the covers, bold enough to read as a hierarchy signpost.
-    local section_fs = math.max(7,  math.floor(Screen:scaleBySize(8)  * txt_sc))
-    local button_fs  = math.max(10, math.floor(Screen:scaleBySize(11) * txt_sc))
+    local section_fs = math.max(7, math.floor(Screen:scaleBySize(8) * txt_sc))
+    local button_fs  = math.max(7, math.floor(Screen:scaleBySize(8) * txt_sc))
 
     -- Fixed-height elements on the landing (top-down).  Used to compute
     -- carousel cover height so the page never needs scrolling.
@@ -835,11 +868,11 @@ function BookFusionTab:_buildLanding(sw, content_h)
     -- aspect ratio (typical book cover) AND at whatever the height budget
     -- can spare, whichever is smaller.
     local reserved = top_pad
-                   + section_lbl_h + pre_section_gap                -- CR heading
+                   + section_lbl_h + pre_section_gap                  -- CR heading
                    + tile_text_h + tile_pct_h + Screen:scaleBySize(8) -- tile extras
                    + between_sections
-                   + section_lbl_h + pre_section_gap                -- Folders heading
-                   + button_h + UI.PAD + button_h                   -- 2 nav buttons
+                   + section_lbl_h + pre_section_gap                  -- Folders heading
+                   + 3 * button_h + 2 * math.floor(UI.PAD / 2)        -- 3 nav buttons + 2 half-PAD gaps
                    + bot_pad
     local cover_budget = content_h - reserved
     local cover_h = math.min(math.floor(tile_w * 1.55 * cov_sc), cover_budget)
@@ -942,29 +975,30 @@ function BookFusionTab:_buildLanding(sw, content_h)
         cr_note = "(" .. _("offline") .. ")"
     end
 
-    -- Nav buttons — borderless (per spec), left-aligned label with a
-    -- chevron on the right.  Acts as a big tappable row rather than a
-    -- "button" shape.
-    local function _navButton(label, badge_count, on_tap)
-        local count_text = badge_count and ("  (" .. tostring(badge_count) .. ")") or ""
+    -- Nav buttons — borderless, left-aligned label + chevron, no left pad
+    -- so the label sits flush with the rest of the page's content column.
+    --
+    -- Square tap feedback: Button:init picks rounded corners whenever a
+    -- `background` is passed (button.lua:224), and its flash routine
+    -- re-rounds when either `radius == nil` OR `self.background` is
+    -- truthy (button.lua:402).  Native square-flash recipe: `radius = 0`
+    -- AND no `background` → init's else-branch keeps radius=0, flash's
+    -- else-branch uses `invert = true` → square invert.
+    local function _navButton(label, on_tap)
         return Button:new{
-            text           = label .. count_text .. "   ›",
+            text           = label .. " ›",
             align          = "left",
             width          = inner_w,
             height         = button_h,
             text_font_size = button_fs,
-            text_font_bold = false,
-            bordersize     = 0,                -- remove visible border
-            background     = Blitbuffer.COLOR_WHITE,
-            padding        = Screen:scaleBySize(4),
+            text_font_bold = true,
+            bordersize     = 0,
+            radius         = 0,  -- keeps tap-feedback flash square
+            padding_h      = Screen:scaleBySize(4),
+            padding_v      = Screen:scaleBySize(4),
             callback       = on_tap,
         }
     end
-
-    local tbr_slot    = Cache.get("planned_to_read")
-    local fav_slot    = Cache.get("favorites")
-    local tbr_count   = tbr_slot and tbr_slot.books and #tbr_slot.books or nil
-    local fav_count   = fav_slot and fav_slot.books and #fav_slot.books or nil
 
     -- Build the page layout.
     --
@@ -976,7 +1010,7 @@ function BookFusionTab:_buildLanding(sw, content_h)
     --   between_sections
     --   "Folders"             (heading)
     --   pre_section_gap
-    --   [ To Be Read  › ]
+    --   [ Plan to Read  › ]
     --   UI.PAD
     --   [ Favorites   › ]
     --   bot_pad
@@ -1014,9 +1048,17 @@ function BookFusionTab:_buildLanding(sw, content_h)
     vg[#vg+1] = VerticalSpan:new{ width = between_sections }
     vg[#vg+1] = _sectionLabel(_("Folders"))
     vg[#vg+1] = VerticalSpan:new{ width = pre_section_gap }
-    vg[#vg+1] = _navButton(_("To Be Read"),  tbr_count, function() self:_enterSubpage("tbr")       end)
-    vg[#vg+1] = VerticalSpan:new{ width = UI.PAD }
-    vg[#vg+1] = _navButton(_("Favorites"),   fav_count, function() self:_enterSubpage("favorites") end)
+    -- Half-PAD gap between folder buttons — just enough visual breathing
+    -- room without making the section feel disconnected.
+    local folder_gap = math.floor(UI.PAD / 2)
+    vg[#vg+1] = _navButton(_("Plan to Read"),        function() self:_enterSubpage("tbr")       end)
+    vg[#vg+1] = VerticalSpan:new{ width = folder_gap }
+    vg[#vg+1] = _navButton(_("Favorites"),         function() self:_enterSubpage("favorites") end)
+    vg[#vg+1] = VerticalSpan:new{ width = folder_gap }
+    -- "Browse BookFusion" hands off to the BF plugin's own Menu widget
+    -- (onSearchBooks), which lists every bookshelf + collection.  This is
+    -- the escape hatch for anything outside the three cached lists above.
+    vg[#vg+1] = _navButton(_("Browse BookFusion"), function() Data.openBrowser() end)
     vg[#vg+1] = VerticalSpan:new{ width = bot_pad }
 
     -- Apply side-padding frame and clamp to content height.
