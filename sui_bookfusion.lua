@@ -35,7 +35,6 @@ local Button          = require("ui/widget/button")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local DataStorage     = require("datastorage")
 local Device          = require("device")
-local Event           = require("ui/event")
 local Font            = require("ui/font")
 local FrameContainer  = require("ui/widget/container/framecontainer")
 local Geom            = require("ui/geometry")
@@ -183,13 +182,6 @@ function Cache.isStale(k, ttl)
     local slot = Cache.get(k)
     if not slot or not slot.fetched_at then return true end
     return (os.time() - slot.fetched_at) > (ttl or CACHE_DEFAULT_TTL)
-end
-
-function Cache.clearAll()
-    local s = _cacheOpen()
-    if not s then return end
-    for _i, k in ipairs(Cache.LIST_KEYS) do s:delSetting(_cacheSlotKey(k)) end
-    pcall(function() s:flush() end)
 end
 
 -- ===========================================================================
@@ -504,21 +496,18 @@ local function _coverImage(bb, bb_w, bb_h, box_w, box_h)
     return frame, actual_w, actual_h
 end
 
--- Title label constrained to `max_lines` rows.  TextBoxWidget supports
--- height-based clipping + ellipsis when text overflows the allotted height
--- (height_overflow_show_ellipsis).  No max_lines attribute exists; we compute
--- the pixel height from font size × line_height × max_lines instead.
-local function _titleLabel(title, w, font_size, max_lines)
-    local lh_mul  = 1.25  -- approximate TextBoxWidget line pitch
-    local line_h  = math.ceil(font_size * lh_mul)
-    local max_h   = line_h * (max_lines or 2)
+-- Title label constrained to 2 rows.  TextBoxWidget has no native max_lines;
+-- we clip by a height of `2 × line_h` + height_overflow_show_ellipsis so the
+-- widget truncates with an ellipsis when the title wraps past two lines.
+local function _titleLabel(title, w, font_size)
+    local line_h = math.ceil(font_size * 1.25)  -- approximate TextBoxWidget line pitch
     return TextBoxWidget:new{
-        text      = title or _("Untitled"),
-        face      = Font:getFace("cfont", font_size),
-        width     = w,
-        alignment = "center",
-        height                         = max_h,
-        height_overflow_show_ellipsis  = true,
+        text                          = title or _("Untitled"),
+        face                          = Font:getFace("cfont", font_size),
+        width                         = w,
+        alignment                     = "center",
+        height                        = line_h * 2,
+        height_overflow_show_ellipsis = true,
     }
 end
 
@@ -528,7 +517,7 @@ end
 -- No inline percentage label — user wants just the bar.
 local BAR_BASE_H = Screen:scaleBySize(7)
 
-local function _progressBar(pct, w, _text_scale)
+local function _progressBar(pct, w)
     local bar_h = BAR_BASE_H
     local fill  = math.max(0, math.min(1, pct or 0))
     local fw    = math.max(0, math.floor(w * fill))
@@ -561,15 +550,14 @@ function BookTile:init()
     -- border on each side).  We use that actual width for the progress bar
     -- so it sits flush under the visible cover.  Placeholder covers fill the
     -- whole box, so actual_w falls back to cov_w in that branch.
-    local cover, actual_w, actual_h
+    local cover, actual_w
     if book.cover_url and book.cover_url ~= "" then
         local bb, bb_w, bb_h = Covers.getBB(book.cover_url, book.cover_w, book.cover_h)
-        if bb then cover, actual_w, actual_h = _coverImage(bb, bb_w, bb_h, cov_w, cov_h) end
+        if bb then cover, actual_w = _coverImage(bb, bb_w, bb_h, cov_w, cov_h) end
     end
     if not cover then
         cover    = _coverPlaceholder(book.title, cov_w, cov_h)
         actual_w = cov_w
-        actual_h = cov_h
     end
 
     -- Font sizes.  Title = 7px base (a touch smaller than the earlier 8px
@@ -597,12 +585,12 @@ function BookTile:init()
         -- Bar width = cover's actual rendered width (after best-fit scaling),
         -- so it lines up perfectly under the visible cover even when the book
         -- cover's aspect ratio differs from the tile box's aspect.
-        vg[#vg+1] = _progressBar(pct, actual_w, txt_sc)
+        vg[#vg+1] = _progressBar(pct, actual_w)
     end
     vg[#vg+1] = VerticalSpan:new{ width = Screen:scaleBySize(4) }
     -- Title uses the full tile width so long titles can wrap/ellipse nicely
     -- across the tile rather than being cramped under a narrower cover.
-    vg[#vg+1] = _titleLabel(book.title, w, title_fs, 2)
+    vg[#vg+1] = _titleLabel(book.title, w, title_fs)
 
     self.dimen = Geom:new{ w = w, h = h }
     self[1] = FrameContainer:new{
@@ -653,13 +641,12 @@ function BookFusionTab:init()
     --   _view        : "landing" | "tbr" | "favorites"
     --   _cr_page     : 1-based carousel page (landing)
     --   _grid_page   : 1-based grid page (subpages)
-    --   _progress    : [list_key] = "refreshing" | "error"
     --   _refreshing  : single-flight guard
+    --   _sync_popup  : InfoMessage shown during a manual sync (or nil)
     --   _cover_halt  : halt fn for current in-flight image-loader batch
     self._view      = self._view      or "landing"
     self._cr_page   = self._cr_page   or 1
     self._grid_page = self._grid_page or 1
-    self._progress  = self._progress  or {}
 
     -- Title bar — rebuilt on every view change in _rebuildAndRepaint so the
     -- left icon reflects the current mode (search on landing, back arrow on
@@ -955,14 +942,12 @@ function BookFusionTab:_buildLanding(sw, content_h)
     -- Section label — bold + small + mid-grey.  Used for both
     -- "Currently Reading" and "Folders" so they read as peers.
     local SECTION_GRAY = Blitbuffer.gray(0.45)
-    local function _sectionLabel(text, note)
-        local face = Font:getFace("cfont", section_fs)
-        local display = (note and note ~= "") and (text .. "   " .. note) or text
+    local function _sectionLabel(text)
         return LeftContainer:new{
             dimen = Geom:new{ w = inner_w, h = section_lbl_h },
             TextWidget:new{
-                text    = display,
-                face    = face,
+                text    = text,
+                face    = Font:getFace("cfont", section_fs),
                 bold    = true,
                 fgcolor = SECTION_GRAY,
             },
@@ -1413,18 +1398,5 @@ function M.show(_on_qa_tap)
     M._instance = w
     UIManager:show(w)
 end
-
-function M.close()
-    if M._instance then
-        pcall(function() UIManager:close(M._instance) end)
-        M._instance = nil
-    end
-end
-
--- Exposed for debugging / potential future settings UI.
-M._Settings = Settings
-M._Cache    = Cache
-M._Data     = Data
-M._Covers   = Covers
 
 return M
