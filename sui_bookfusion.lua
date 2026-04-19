@@ -1063,11 +1063,21 @@ function BookFusionTab:_buildLanding(sw, content_h)
     -- Visual breathing room between the subtle label and the cover row.
     vg[#vg+1] = VerticalSpan:new{ width = pre_carousel_gap }
     if #cr_books == 0 then
+        -- First-time / after-clear-cache state.  We don't auto-sync (the tab
+        -- is fully offline by spec), so nudge the user toward the refresh
+        -- icon instead of showing a dead "No books" string.
+        local empty_text
+        if self._progress.currently_reading == "refreshing" then
+            empty_text = _("Loading…")
+        elseif Cache.get("currently_reading") == nil then
+            empty_text = _("Tap ↻ to sync your BookFusion library.")
+        else
+            empty_text = _("No books in this list.")
+        end
         vg[#vg+1] = LeftContainer:new{
             dimen = Geom:new{ w = inner_w, h = tile_h },
             TextBoxWidget:new{
-                text = self._progress.currently_reading == "refreshing"
-                    and _("Loading…") or _("No books in this list."),
+                text = empty_text,
                 face = Font:getFace("cfont",
                     math.max(10, math.floor(Screen:scaleBySize(11) * txt_sc))),
                 width = inner_w,
@@ -1259,9 +1269,10 @@ end
 function BookFusionTab:_enterSubpage(which)
     self._view = which
     self._grid_page = 1
+    -- Offline by design: render from disk cache only.  Covers that haven't
+    -- been downloaded yet show the typographic placeholder; tapping ↻
+    -- while on this subpage is how the user opts in to fetching them.
     self:_rebuildAndRepaint()
-    -- Kick off cover fetch for this list (landing pre-fetches only the CR row).
-    self:_prefetchVisibleCovers()
 end
 
 function BookFusionTab:_exitSubpage()
@@ -1297,42 +1308,55 @@ end
 function BookFusionTab:_refreshLists(force)
     if not Data.isLinked() then return end
     if self._refreshing then return end
-    self._refreshing = true
 
-    local pending = {}
-    for _i, key in ipairs(Cache.LIST_KEYS) do
-        if force or Cache.isStale(key) then
-            pending[#pending+1] = key
-            self._progress[key] = "refreshing"
+    -- runWhenOnline prompts the user to turn on Wi-Fi if it's off.  If the
+    -- user *cancels* that prompt, our callback is never invoked — so we
+    -- MUST NOT commit any state (self._refreshing, self._progress) before
+    -- we're inside the callback.  Otherwise the "refreshing…" label would
+    -- stay on screen forever and future taps on ↻ would short-circuit via
+    -- the `if self._refreshing then return end` guard above.
+    NetworkMgr:runWhenOnline(function()
+        if self._closed then return end
+        self._refreshing = true
+
+        local pending = {}
+        for _i, key in ipairs(Cache.LIST_KEYS) do
+            if force or Cache.isStale(key) then
+                pending[#pending+1] = key
+                self._progress[key] = "refreshing"
+            end
         end
-    end
-    if #pending == 0 then self._refreshing = false; return end
-    self:_rebuildAndRepaint()
-
-    local idx = 0
-    local function step()
-        idx = idx + 1
-        if idx > #pending then
+        if #pending == 0 then
             self._refreshing = false
-            self:_prefetchVisibleCovers()
             return
         end
-        local key = pending[idx]
-        local params = Cache.LIST_PARAMS[key] or { list = key }
-        Data.fetchListAll(params, function(ok, books)
-            if ok and type(books) == "table" then
-                Cache.put(key, books)
-                self._progress[key] = nil
-            else
-                logger.warn("simpleui-bf: fetch failed for", key, tostring(books))
-                self._progress[key] = "error"
+        self:_rebuildAndRepaint()
+
+        local idx = 0
+        local function step()
+            idx = idx + 1
+            if idx > #pending then
+                self._refreshing = false
+                self:_prefetchVisibleCovers()
+                return
             end
-            if self._closed then return end
-            self:_rebuildAndRepaint()
-            step()
-        end)
-    end
-    NetworkMgr:runWhenOnline(function() step() end)
+            local key = pending[idx]
+            local params = Cache.LIST_PARAMS[key] or { list = key }
+            Data.fetchListAll(params, function(ok, books)
+                if ok and type(books) == "table" then
+                    Cache.put(key, books)
+                    self._progress[key] = nil
+                else
+                    logger.warn("simpleui-bf: fetch failed for", key, tostring(books))
+                    self._progress[key] = "error"
+                end
+                if self._closed then return end
+                self:_rebuildAndRepaint()
+                step()
+            end)
+        end
+        step()
+    end)
 end
 
 -- Kick off async downloads for the covers currently on screen.
@@ -1367,11 +1391,16 @@ end
 -- ---------------------------------------------------------------------------
 
 function BookFusionTab:onShow()
-    UIManager:scheduleIn(0.1, function()
-        if self._closed then return end
-        self:_refreshLists(false)
-        self:_prefetchVisibleCovers()
-    end)
+    -- The tab is fully offline by design.  Opening it triggers ZERO network
+    -- traffic: we render whatever is already in the on-disk list cache and
+    -- the on-disk cover cache.  The user explicitly opts in to sync by
+    -- tapping the ↻ icon in the title bar, which fires _refreshLists(true)
+    -- → pulls fresh list JSON + downloads the current view's missing covers.
+    --
+    -- Rationale: many BookFusion users read on devices that spend most of
+    -- their lives with Wi-Fi off (battery life, airplane mode).  Silent
+    -- background syncs would pop the KOReader Wi-Fi prompt every time they
+    -- switch to the tab — noisy and surprising.
 end
 
 function BookFusionTab:onCloseWidget()
