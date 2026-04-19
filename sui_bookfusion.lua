@@ -735,8 +735,13 @@ function BookFusionTab:_buildTitleBar()
         show_parent              = self,
         fullscreen               = true,
         title                    = title,
-        title_top_padding        = Screen:scaleBySize(6),
-        button_padding           = Screen:scaleBySize(11),  -- outer edge gap
+        -- Omit title_top_padding so TitleBar auto-computes it by aligning
+        -- the text baseline with the icon baseline (titlebar.lua:183-189).
+        -- With the explicit 6px override it used to have, the title+icons
+        -- sat near the top of the bar with visible empty space below;
+        -- baseline-alignment centres them vertically within the bar's
+        -- visual height.
+        button_padding           = Screen:scaleBySize(11),
         left_icon                = left_icon,
         left_icon_size_ratio     = 1,
         left_icon_tap_callback   = left_cb,
