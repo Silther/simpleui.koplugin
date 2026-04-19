@@ -497,16 +497,28 @@ local function _coverImage(bb, bb_w, bb_h, box_w, box_h)
 end
 
 -- Title label constrained to 2 rows.  TextBoxWidget has no native max_lines;
--- we clip by a height of `2 × line_h` + height_overflow_show_ellipsis so the
--- widget truncates with an ellipsis when the title wraps past two lines.
+-- we size `height` to fit exactly 2 lines and let height_overflow_show_ellipsis
+-- truncate a third line with "…".
+--
+-- Gotcha: `Font:getFace(name, size)` itself runs the size through
+-- `Screen:scaleBySize` (font.lua:276) before handing it to FreeType.  If the
+-- caller already pre-scaled the size (as we do — title_fs = scaleBySize(6))
+-- the resulting `face.size` is *double*-scaled.  TextBoxWidget then computes
+-- `line_height_px = round((1 + 0.3) * face.size)` (textboxwidget.lua:147), so
+-- our height has to be derived from `face.size`, not the pre-scale `size` we
+-- requested — otherwise on a high-DPI device `floor(height / line_height_px)`
+-- falls to 1 and every title is truncated to a single line.  Computing
+-- `line_h` from the built face (and adding a 1 px rounding margin) makes the
+-- 2-row layout work regardless of the device's scale factor.
 local function _titleLabel(title, w, font_size)
-    local line_h = math.ceil(font_size * 1.25)  -- approximate TextBoxWidget line pitch
+    local face   = Font:getFace("cfont", font_size)
+    local line_h = math.floor((1 + 0.3) * face.size + 0.5)
     return TextBoxWidget:new{
         text                          = title or _("Untitled"),
-        face                          = Font:getFace("cfont", font_size),
+        face                          = face,
         width                         = w,
         alignment                     = "center",
-        height                        = line_h * 2,
+        height                        = line_h * 2 + 1,
         height_overflow_show_ellipsis = true,
     }
 end
@@ -560,12 +572,12 @@ function BookTile:init()
         actual_w = cov_w
     end
 
-    -- Font sizes.  Title = 7px base (a touch smaller than the earlier 8px
-    -- so covers carry the visual weight, not the text).  Scaled by the
-    -- user's text_scale setting.  No percentage text under the bar — the
-    -- bar itself is the progress indicator per user spec.
+    -- Font sizes.  Title = 6px base (slightly smaller so longer titles can
+    -- wrap onto a second line without blowing the tile height budget).
+    -- Scaled by the user's text_scale setting.  No percentage text under
+    -- the bar — the bar itself is the progress indicator per user spec.
     local txt_sc   = o.text_scale or 1.0
-    local title_fs = math.max(7, math.floor(Screen:scaleBySize(7) * txt_sc))
+    local title_fs = math.max(6, math.floor(Screen:scaleBySize(6) * txt_sc))
 
     -- Layout order (per user spec, feedback pass 3):
     --     cover
@@ -831,7 +843,7 @@ function BookFusionTab:_buildLanding(sw, content_h)
 
     -- Section label — bold + small + mid-gray.  Small enough not to compete
     -- with the covers, bold enough to read as a hierarchy signpost.
-    local section_fs = math.max(7, math.floor(Screen:scaleBySize(8) * txt_sc))
+    local section_fs = math.max(6, math.floor(Screen:scaleBySize(7) * txt_sc))
     local button_fs  = math.max(7, math.floor(Screen:scaleBySize(8) * txt_sc))
 
     -- Fixed-height elements on the landing (top-down).  Used to compute
@@ -839,7 +851,14 @@ function BookFusionTab:_buildLanding(sw, content_h)
     local section_lbl_h   = Screen:scaleBySize(10) + UI.PAD2
     local pre_section_gap = UI.PAD        -- gap between a heading and its content
     local button_h        = Screen:scaleBySize(36)
-    local tile_text_h     = Screen:scaleBySize(22)  -- 2 lines of 8px title
+    -- tile_text_h must accommodate the actual 2-line rendered height of the
+    -- title TextBoxWidget, which depends on face.size (double-scaled on hi-DPI
+    -- devices via Font:getFace).  Compute it from the same face the tile will
+    -- use so the budget stays accurate on every device.
+    local _tile_title_fs   = math.max(6, math.floor(Screen:scaleBySize(6) * txt_sc))
+    local _tile_title_face = Font:getFace("cfont", _tile_title_fs)
+    local _tile_title_lh   = math.floor((1 + 0.3) * _tile_title_face.size + 0.5)
+    local tile_text_h     = _tile_title_lh * 2 + Screen:scaleBySize(3)  -- 2 lines + rounding margin
     local tile_pct_h      = Screen:scaleBySize(11)  -- 7px bar + gap
     local top_pad         = UI.PAD
     local between_sections = UI.MOD_GAP   -- gap between CR row and Folders heading
@@ -847,7 +866,10 @@ function BookFusionTab:_buildLanding(sw, content_h)
 
     -- Arrow width + gap from the carousel.
     local arrow_w   = Screen:scaleBySize(36)
-    local arrow_gap = UI.PAD2
+    -- Horizontal gap between arrow and cover: match the outer gap between
+    -- arrow and screen edge (UI.SIDE_PAD) so each arrow sits dead-centre in
+    -- the corridor between the frame edge and the first/last cover.
+    local arrow_gap = UI.SIDE_PAD
     local carousel_inner_w = inner_w - 2 * (arrow_w + arrow_gap)
 
     -- Tile width from cols.
@@ -860,7 +882,7 @@ function BookFusionTab:_buildLanding(sw, content_h)
     -- aspect ratio (typical book cover) AND at whatever the height budget
     -- can spare, whichever is smaller.
     local reserved = top_pad
-                   + section_lbl_h + pre_section_gap                  -- CR heading
+                   + section_lbl_h + pre_section_gap + Screen:scaleBySize(6) -- CR heading (extra breathing room before covers)
                    + tile_text_h + tile_pct_h + Screen:scaleBySize(8) -- tile extras
                    + between_sections
                    + section_lbl_h + pre_section_gap                  -- Folders heading
@@ -917,26 +939,44 @@ function BookFusionTab:_buildLanding(sw, content_h)
         }
     end
 
-    -- Arrow buttons (disabled-looking when at edges; we simply hide via
-    -- a same-sized blank to keep horizontal balance).
+    -- Arrow buttons — native IconButton with default flash on tap.
+    -- Vertical placement: we want the icon slightly BELOW the midline of
+    -- (cover + progress bar), not the tile centre.  Wrapping the arrow in
+    -- a CenterContainer of height = cover_h + cover→bar gap + bar_h +
+    -- small nudge centres the icon within that region; the nudge puts it a
+    -- few px below the true midline.  The HorizontalGroup below uses
+    -- align="top" so each arrow's CenterContainer starts at the same y as
+    -- the covers (y=0 of the carousel row), not vertically centred against
+    -- the full tile height.
+    local cover_bar_nudge = Screen:scaleBySize(8)   -- lower than pure centre
+    local arrow_box_h = cover_h + Screen:scaleBySize(4) + BAR_BASE_H + cover_bar_nudge
     local function _arrow(icon, enabled, cb)
-        if not enabled then
-            return HorizontalSpan:new{ width = arrow_w }
+        local inner
+        if enabled then
+            inner = IconButton:new{
+                icon        = icon,
+                width       = arrow_w,
+                height      = arrow_w,
+                padding     = 0,
+                callback    = cb,
+                show_parent = self,
+            }
+        else
+            -- Keep the column width so the carousel stays horizontally
+            -- balanced when we're at the first / last page.
+            inner = HorizontalSpan:new{ width = arrow_w }
         end
-        return IconButton:new{
-            icon        = icon,
-            width       = arrow_w,
-            height      = arrow_w,
-            padding     = 0,
-            allow_flash = false,
-            callback    = cb,
-            show_parent = self,
+        return CenterContainer:new{
+            dimen = Geom:new{ w = arrow_w, h = arrow_box_h },
+            inner,
         }
     end
     local left_arrow  = _arrow("chevron.left",  self._cr_page > 1,          function() self:_cycleCarousel(-1) end)
     local right_arrow = _arrow("chevron.right", self._cr_page < total_pages, function() self:_cycleCarousel( 1) end)
 
-    local carousel_row = HorizontalGroup:new{ align = "center",
+    -- align = "top" anchors every child at y=0 of the row, so each arrow's
+    -- CenterContainer establishes its own cover-aligned vertical frame.
+    local carousel_row = HorizontalGroup:new{ align = "top",
         left_arrow,
         HorizontalSpan:new{ width = arrow_gap },
         carousel_body,
@@ -1000,7 +1040,10 @@ function BookFusionTab:_buildLanding(sw, content_h)
     local vg = VerticalGroup:new{ align = "left" }
     vg[#vg+1] = VerticalSpan:new{ width = top_pad }
     vg[#vg+1] = _sectionLabel(_("Currently Reading"))
-    vg[#vg+1] = VerticalSpan:new{ width = pre_section_gap }
+    -- A touch more breathing room than the generic pre_section_gap so the
+    -- covers don't feel crammed under the heading.  Folders still uses
+    -- pre_section_gap below to keep its buttons close to its heading.
+    vg[#vg+1] = VerticalSpan:new{ width = pre_section_gap + Screen:scaleBySize(6) }
     if #cr_books == 0 then
         -- First-time / after-clear-cache state.  We don't auto-sync (the tab
         -- is fully offline by spec), so nudge the user toward the refresh
@@ -1142,13 +1185,13 @@ function BookFusionTab:_buildSubpage(sw, content_h)
         }
     end
 
-    -- Pager: "‹  Page X / Y  ›"
+    -- Pager: "‹  Page X / Y  ›" — same flash behaviour as the carousel arrows.
     local function _pagerArrow(icon, enabled, cb)
         if not enabled then return HorizontalSpan:new{ width = Screen:scaleBySize(32) } end
         return IconButton:new{
             icon = icon,
             width = Screen:scaleBySize(32), height = Screen:scaleBySize(32),
-            padding = 0, allow_flash = false,
+            padding = 0,
             callback = cb, show_parent = self,
         }
     end
