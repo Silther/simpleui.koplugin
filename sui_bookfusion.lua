@@ -642,6 +642,12 @@ local BookFusionTab = InputContainer:extend{
     covers_fullscreen  = true,
     is_borderless      = true,
     disable_double_tap = true,
+    -- Signal to UIManager:setDirty that this widget contains cover art
+    -- (photographs with many greyscale levels).  Without this, the initial
+    -- "ui" refresh uses a bi-level pass and covers look washed out for up
+    -- to ~30 s until the next full refresh.  Same hint sui_homescreen sets
+    -- via `self.dithered = page_has_covers` (sui_homescreen.lua:2289).
+    dithered           = true,
 }
 
 function BookFusionTab:init()
@@ -1245,7 +1251,15 @@ function BookFusionTab:_rebuildAndRepaint()
         self._body_vg[1]  = new_tb
         self._body_vg[2]  = self:_buildBodyContent()
     end
-    UIManager:setDirty(self, "ui")
+    -- Dithering hint for e-ink refreshes.  Without this, the first paint
+    -- after a cover lands on screen uses a bi-level refresh that crushes
+    -- photo tonality — covers look washed out / muted until KOReader
+    -- happens to schedule a full refresh 30+ s later.  UIManager checks
+    -- `widget.dithered` on setDirty (uimanager.lua:241) and routes the
+    -- repaint through a proper dithered mode when the flag is set.  Same
+    -- pattern sui_homescreen uses for its cover rows (sui_homescreen.lua:2289).
+    self.dithered = true
+    UIManager:setDirty(self, "ui", nil, true)
 end
 
 function BookFusionTab:_cycleCarousel(delta)
