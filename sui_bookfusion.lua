@@ -510,7 +510,8 @@ end
 -- falls to 1 and every title is truncated to a single line.  Computing
 -- `line_h` from the built face (and adding a 1 px rounding margin) makes the
 -- 2-row layout work regardless of the device's scale factor.
-local function _titleLabel(title, w, font_size)
+local function _titleLabel(title, w, font_size, lines)
+    lines = lines or 2
     local face   = Font:getFace("cfont", font_size)
     local line_h = math.floor((1 + 0.3) * face.size + 0.5)
     return TextBoxWidget:new{
@@ -518,7 +519,7 @@ local function _titleLabel(title, w, font_size)
         face                          = face,
         width                         = w,
         alignment                     = "center",
-        height                        = line_h * 2 + 1,
+        height                        = line_h * lines + 1,
         height_overflow_show_ellipsis = true,
     }
 end
@@ -602,7 +603,9 @@ function BookTile:init()
     vg[#vg+1] = VerticalSpan:new{ width = Screen:scaleBySize(4) }
     -- Title uses the full tile width so long titles can wrap/ellipse nicely
     -- across the tile rather than being cramped under a narrower cover.
-    vg[#vg+1] = _titleLabel(book.title, w, title_fs)
+    -- opts.title_lines lets callers pick 1 (subpage grids) or 2 (carousel);
+    -- default is 2 so existing callers that don't set it keep the old behaviour.
+    vg[#vg+1] = _titleLabel(book.title, w, title_fs, o.title_lines or 2)
 
     self.dimen = Geom:new{ w = w, h = h }
     self[1] = FrameContainer:new{
@@ -1130,8 +1133,14 @@ function BookFusionTab:_buildSubpage(sw, content_h)
     local tile_gap = UI.PAD2
     local row_gap  = UI.PAD
     local tile_w = math.floor((inner_w - (grid_cols - 1) * tile_gap) / grid_cols)
-    -- We reserve ~28px below each cover for the title line.
-    local title_h_reserve = Screen:scaleBySize(28)
+    -- Subpage tiles show a 1-line title.  Reserve just one actual line of
+    -- the rendered face height (same formula as _titleLabel uses) plus a
+    -- few px of rounding margin — lets more rows fit per grid page than
+    -- the old 2-line reservation did.
+    local _sub_title_fs   = math.max(6, math.floor(Screen:scaleBySize(6) * txt_sc))
+    local _sub_title_face = Font:getFace("cfont", _sub_title_fs)
+    local _sub_title_lh   = math.floor((1 + 0.3) * _sub_title_face.size + 0.5)
+    local title_h_reserve = _sub_title_lh + Screen:scaleBySize(3)
     -- How many rows fit in grid_h given tile_w + aspect + title?
     -- Work out tile_h first:
     local cover_h = math.floor(tile_w * 1.5 * cov_sc)
@@ -1163,6 +1172,7 @@ function BookFusionTab:_buildSubpage(sw, content_h)
                     h          = tile_h,
                     cover_h    = cover_h,
                     show_progress = false,  -- subpages omit progress per spec
+                    title_lines   = 1,       -- single-line titles on subpages
                     text_scale = txt_sc,
                     on_tap     = function(b) Data.selectBook(b) end,
                 },
