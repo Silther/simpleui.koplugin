@@ -968,13 +968,6 @@ function BookFusionTab:_buildLanding(sw, content_h)
             },
         }
     end
-    local cr_note
-    if self._progress.currently_reading == "refreshing" then
-        cr_note = "(" .. _("refreshing…") .. ")"
-    elseif self._progress.currently_reading == "error" then
-        cr_note = "(" .. _("offline") .. ")"
-    end
-
     -- Nav buttons — borderless, left-aligned label + chevron, no left pad
     -- so the label sits flush with the rest of the page's content column.
     --
@@ -1016,16 +1009,16 @@ function BookFusionTab:_buildLanding(sw, content_h)
     --   bot_pad
     local vg = VerticalGroup:new{ align = "left" }
     vg[#vg+1] = VerticalSpan:new{ width = top_pad }
-    vg[#vg+1] = _sectionLabel(_("Currently Reading"), cr_note)
+    vg[#vg+1] = _sectionLabel(_("Currently Reading"))
     vg[#vg+1] = VerticalSpan:new{ width = pre_section_gap }
     if #cr_books == 0 then
         -- First-time / after-clear-cache state.  We don't auto-sync (the tab
         -- is fully offline by spec), so nudge the user toward the refresh
-        -- icon instead of showing a dead "No books" string.
+        -- icon instead of showing a dead "No books" string.  A sync in
+        -- progress is surfaced via the InfoMessage popup from _refreshLists,
+        -- not an inline label.
         local empty_text
-        if self._progress.currently_reading == "refreshing" then
-            empty_text = _("Loading…")
-        elseif Cache.get("currently_reading") == nil then
+        if Cache.get("currently_reading") == nil then
             empty_text = _("Tap ↻ to sync your BookFusion library.")
         else
             empty_text = _("No books in this list.")
@@ -1277,44 +1270,60 @@ function BookFusionTab:_refreshLists(force)
 
     -- runWhenOnline prompts the user to turn on Wi-Fi if it's off.  If the
     -- user *cancels* that prompt, our callback is never invoked — so we
-    -- MUST NOT commit any state (self._refreshing, self._progress) before
-    -- we're inside the callback.  Otherwise the "refreshing…" label would
-    -- stay on screen forever and future taps on ↻ would short-circuit via
-    -- the `if self._refreshing then return end` guard above.
+    -- MUST NOT commit any state (self._refreshing, self._sync_popup) before
+    -- we're inside the callback.  Otherwise the popup would stay on screen
+    -- and future taps on ↻ would short-circuit via the `if self._refreshing`
+    -- guard above.
     NetworkMgr:runWhenOnline(function()
         if self._closed then return end
-        self._refreshing = true
 
         local pending = {}
         for _i, key in ipairs(Cache.LIST_KEYS) do
             if force or Cache.isStale(key) then
                 pending[#pending+1] = key
-                self._progress[key] = "refreshing"
             end
         end
-        if #pending == 0 then
-            self._refreshing = false
-            return
-        end
-        self:_rebuildAndRepaint()
+        if #pending == 0 then return end
 
-        local idx = 0
+        self._refreshing = true
+
+        -- Show a persistent "Syncing…" popup for as long as the fetch loop
+        -- is running.  Replaces the old inline "(refreshing…)" headline
+        -- note so the header stays clean.  `timeout = 0` keeps it up until
+        -- we explicitly close it on the last step.
+        local InfoMessage = require("ui/widget/infomessage")
+        self._sync_popup = InfoMessage:new{
+            text    = _("Syncing…"),
+            timeout = 0,
+        }
+        UIManager:show(self._sync_popup)
+
+        local idx, failed = 0, 0
+        local function finish()
+            self._refreshing = false
+            if self._sync_popup then
+                pcall(function() UIManager:close(self._sync_popup) end)
+                self._sync_popup = nil
+            end
+            if failed > 0 then
+                UIManager:show(InfoMessage:new{
+                    text    = _("Couldn't refresh some BookFusion lists."),
+                    timeout = 3,
+                })
+            end
+            self:_prefetchVisibleCovers()
+        end
         local function step()
             idx = idx + 1
-            if idx > #pending then
-                self._refreshing = false
-                self:_prefetchVisibleCovers()
-                return
-            end
+            if idx > #pending then finish(); return end
             local key = pending[idx]
             local params = Cache.LIST_PARAMS[key] or { list = key }
             Data.fetchListAll(params, function(ok, books)
                 if ok and type(books) == "table" then
                     Cache.put(key, books)
-                    self._progress[key] = nil
                 else
                     logger.warn("simpleui-bf: fetch failed for", key, tostring(books))
-                    self._progress[key] = "error"
+                    failed = failed + 1
                 end
                 if self._closed then return end
                 self:_rebuildAndRepaint()
@@ -1372,6 +1381,10 @@ end
 function BookFusionTab:onCloseWidget()
     self._closed = true
     if self._cover_halt then pcall(self._cover_halt); self._cover_halt = nil end
+    if self._sync_popup then
+        pcall(function() UIManager:close(self._sync_popup) end)
+        self._sync_popup = nil
+    end
     Covers.freeAll()
     if M._instance == self then M._instance = nil end
 end
