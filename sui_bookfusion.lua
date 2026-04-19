@@ -401,13 +401,18 @@ local function _firstChars(s, n)
 end
 
 local function _coverPlaceholder(title, w, h)
+    -- Inner size must account for the 1px border so the FrameContainer's
+    -- actual rendered outer size matches `w × h` exactly.  (FrameContainer
+    -- computes its size as content_size + 2*bordersize.)  Using `w × h` for
+    -- the CenterContainer's dimen would make the placeholder 2px wider and
+    -- 2px taller than a real cover, causing subtle misalignment.
     return FrameContainer:new{
         bordersize = 1, color = COLOR_COVER_BORDER,
         background = COLOR_COVER_BG,
         padding = 0, margin = 0,
         dimen = Geom:new{ w = w, h = h },
         CenterContainer:new{
-            dimen = Geom:new{ w = w, h = h },
+            dimen = Geom:new{ w = w - 2, h = h - 2 },
             TextWidget:new{
                 text = _firstChars(title or "?", 2):upper(),
                 face = Font:getFace("smallinfofont", Screen:scaleBySize(20)),
@@ -429,6 +434,11 @@ local function _bestFitScale(bb_w, bb_h, max_w, max_h)
     end
 end
 
+-- Build the cover widget AND report its actual rendered outer size (including
+-- the 1px border on each side).  The caller (BookTile) uses this width so the
+-- progress bar ends up exactly under the visible cover — no letterbox gap.
+--
+-- Returns: widget, actual_w, actual_h  (actual_w/h = scaled image + 2*border)
 local function _coverImage(bb, bb_w, bb_h, box_w, box_h)
     -- Inner box inside the 1px border.
     local inner_w = box_w - 2
@@ -445,21 +455,20 @@ local function _coverImage(bb, bb_w, bb_h, box_w, box_h)
         w:_render()
         return w
     end)
-    if not (ok and img) then return nil end
+    if not (ok and img) then return nil, box_w, box_h end
     local sz = img:getSize()
-    return FrameContainer:new{
+    -- Frame hugs the scaled image: no CenterContainer, no letterbox whitespace.
+    -- Tile VerticalGroup(align="center") centers this frame + the progress bar
+    -- within the tile column, keeping them perfectly stacked.
+    local actual_w = sz.w + 2  -- +2 for the 1px border on each side
+    local actual_h = sz.h + 2
+    local frame = FrameContainer:new{
         bordersize = 1, color = COLOR_COVER_BORDER,
         padding = 0, margin = 0,
-        dimen = Geom:new{ w = box_w, h = box_h },
-        CenterContainer:new{
-            dimen = Geom:new{ w = inner_w, h = inner_h },
-            FrameContainer:new{
-                bordersize = 0, padding = 0, margin = 0,
-                width = sz.w, height = sz.h,
-                img,
-            },
-        },
+        dimen = Geom:new{ w = actual_w, h = actual_h },
+        img,
     }
+    return frame, actual_w, actual_h
 end
 
 -- Title label constrained to `max_lines` rows.  TextBoxWidget supports
@@ -480,22 +489,26 @@ local function _titleLabel(title, w, font_size, max_lines)
     }
 end
 
--- Progress bar — structurally identical to module_currently's bar
--- (module_currently.lua:118-127): OverlapGroup stacks a full-width dark
--- "track" LineWidget under a fill-width light "fill" LineWidget.
-local function _progressBar(pct, w, h)
-    local fill = math.max(0, math.min(1, pct or 0))
-    local fw   = math.max(0, math.floor(w * fill))
+-- Progress bar — same shape as the home screen's "simple" bar style
+-- (desktop_modules/module_books_shared.SH.progressBar): OverlapGroup stacks
+-- a full-width dark track LineWidget under a fill-width light LineWidget.
+-- No inline percentage label — user wants just the bar.
+local BAR_BASE_H = Screen:scaleBySize(7)
+
+local function _progressBar(pct, w, _text_scale)
+    local bar_h = BAR_BASE_H
+    local fill  = math.max(0, math.min(1, pct or 0))
+    local fw    = math.max(0, math.floor(w * fill))
     if fw <= 0 then
         return LineWidget:new{
-            dimen = Geom:new{ w = w, h = h },
+            dimen = Geom:new{ w = w, h = bar_h },
             background = COLOR_BAR_BG,
         }
     end
     return OverlapGroup:new{
-        dimen = Geom:new{ w = w, h = h },
-        LineWidget:new{ dimen = Geom:new{ w = w,  h = h }, background = COLOR_BAR_BG },
-        LineWidget:new{ dimen = Geom:new{ w = fw, h = h }, background = COLOR_BAR_FG },
+        dimen = Geom:new{ w = w, h = bar_h },
+        LineWidget:new{ dimen = Geom:new{ w = w,  h = bar_h }, background = COLOR_BAR_BG },
+        LineWidget:new{ dimen = Geom:new{ w = fw, h = bar_h }, background = COLOR_BAR_FG },
     }
 end
 
@@ -510,20 +523,28 @@ function BookTile:init()
     local cov_w = w
     local cov_h = o.cover_h
 
-    -- Cover (real or placeholder).  Covers.getBB returns the BB plus its
-    -- native dims; _coverImage scales best-fit into the tile's cover box.
-    local cover
+    -- Cover (real or placeholder).  _coverImage returns the widget PLUS its
+    -- actual rendered width/height (post best-fit scaling, including the 1px
+    -- border on each side).  We use that actual width for the progress bar
+    -- so it sits flush under the visible cover.  Placeholder covers fill the
+    -- whole box, so actual_w falls back to cov_w in that branch.
+    local cover, actual_w, actual_h
     if book.cover_url and book.cover_url ~= "" then
         local bb, bb_w, bb_h = Covers.getBB(book.cover_url, book.cover_w, book.cover_h)
-        if bb then cover = _coverImage(bb, bb_w, bb_h, cov_w, cov_h) end
+        if bb then cover, actual_w, actual_h = _coverImage(bb, bb_w, bb_h, cov_w, cov_h) end
     end
-    if not cover then cover = _coverPlaceholder(book.title, cov_w, cov_h) end
+    if not cover then
+        cover    = _coverPlaceholder(book.title, cov_w, cov_h)
+        actual_w = cov_w
+        actual_h = cov_h
+    end
 
-    -- Font sizes — tightened after feedback.  Title = 8px base, scaled by
-    -- user's text_scale setting.  Percentage text under the bar was removed
-    -- per user spec — just a bare progress bar.
+    -- Font sizes.  Title = 7px base (a touch smaller than the earlier 8px
+    -- so covers carry the visual weight, not the text).  Scaled by the
+    -- user's text_scale setting.  No percentage text under the bar — the
+    -- bar itself is the progress indicator per user spec.
     local txt_sc   = o.text_scale or 1.0
-    local title_fs = math.max(8, math.floor(Screen:scaleBySize(8) * txt_sc))
+    local title_fs = math.max(7, math.floor(Screen:scaleBySize(7) * txt_sc))
 
     -- Layout order (per user spec, feedback pass 3):
     --     cover
@@ -537,11 +558,17 @@ function BookTile:init()
     vg[#vg+1] = cover
     if o.show_progress then
         local pct = tonumber(book.percentage) or 0
-        -- Bar height matches module_currently (_BASE_BAR_H = 7).
-        local bar_h = Screen:scaleBySize(7)
-        vg[#vg+1] = _progressBar(pct, w, bar_h)
+        -- Cover→bar gap: 4px at base scale (tighter than the home screen's
+        -- 6px because there's no author-descender above the bar here).
+        vg[#vg+1] = VerticalSpan:new{ width = Screen:scaleBySize(4) }
+        -- Bar width = cover's actual rendered width (after best-fit scaling),
+        -- so it lines up perfectly under the visible cover even when the book
+        -- cover's aspect ratio differs from the tile box's aspect.
+        vg[#vg+1] = _progressBar(pct, actual_w, txt_sc)
     end
     vg[#vg+1] = VerticalSpan:new{ width = Screen:scaleBySize(4) }
+    -- Title uses the full tile width so long titles can wrap/ellipse nicely
+    -- across the tile rather than being cramped under a narrower cover.
     vg[#vg+1] = _titleLabel(book.title, w, title_fs, 2)
 
     self.dimen = Geom:new{ w = w, h = h }
@@ -777,42 +804,47 @@ function BookFusionTab:_buildLanding(sw, content_h)
     local cov_sc   = Settings.coverScale()
     local cr_cols  = Settings.crCols()
 
-    -- Section label = subtle, non-bold, slightly smaller ("Currently Reading"
-    -- should not compete visually with the covers).  Button label stays
-    -- readable.  Both can be tuned via navbar_bookfusion_text_scale.
-    local section_fs = math.max(8,  math.floor(Screen:scaleBySize(9)  * txt_sc))
+    -- Section label — bold + small + mid-gray.  Small enough not to compete
+    -- with the covers, bold enough to read as a hierarchy signpost.
+    local section_fs = math.max(7,  math.floor(Screen:scaleBySize(8)  * txt_sc))
     local button_fs  = math.max(10, math.floor(Screen:scaleBySize(11) * txt_sc))
 
-    -- Fixed-height elements on the landing (top-down), used to compute the
+    -- Fixed-height elements on the landing (top-down).  Used to compute
     -- carousel cover height so the page never needs scrolling.
-    local section_lbl_h = Screen:scaleBySize(12) + UI.PAD2
-    local pre_carousel_gap = UI.PAD               -- breathing room label→covers
-    local button_h      = Screen:scaleBySize(36)
-    local tile_text_h   = Screen:scaleBySize(22)  -- 2 lines of 8px title
-    local tile_pct_h    = Screen:scaleBySize(11)  -- just the 7px bar + gap
-    local top_pad       = UI.PAD
-    local mid_gap       = UI.MOD_GAP
-    local bot_pad       = UI.MOD_GAP              -- generous bottom gap
-
-    -- Height budget left for the carousel row (cover + text + bar).
-    local reserved  = top_pad + section_lbl_h + pre_carousel_gap
-                    + mid_gap + button_h + UI.PAD + button_h + bot_pad
-    local carousel_avail_h = content_h - reserved
-    local tile_h = math.max(Screen:scaleBySize(120), carousel_avail_h)
-    local cover_h = tile_h - tile_text_h - tile_pct_h - Screen:scaleBySize(8)
+    local section_lbl_h   = Screen:scaleBySize(10) + UI.PAD2
+    local pre_section_gap = UI.PAD        -- gap between a heading and its content
+    local button_h        = Screen:scaleBySize(36)
+    local tile_text_h     = Screen:scaleBySize(22)  -- 2 lines of 8px title
+    local tile_pct_h      = Screen:scaleBySize(11)  -- 7px bar + gap
+    local top_pad         = UI.PAD
+    local between_sections = UI.MOD_GAP   -- gap between CR row and Folders heading
+    local bot_pad         = UI.PAD
 
     -- Arrow width + gap from the carousel.
-    local arrow_w = Screen:scaleBySize(36)
+    local arrow_w   = Screen:scaleBySize(36)
     local arrow_gap = UI.PAD2
     local carousel_inner_w = inner_w - 2 * (arrow_w + arrow_gap)
 
     -- Tile width from cols.
     local tile_gap = UI.PAD2
-    local tile_w = math.floor((carousel_inner_w - (cr_cols - 1) * tile_gap) / cr_cols)
-    -- Enforce cover aspect <= 1.55 ratio so wide tiles don't get oversize covers.
-    local max_cover_h = math.floor(tile_w * 1.55 * cov_sc)
-    if cover_h > max_cover_h then cover_h = max_cover_h end
+    local tile_w   = math.floor((carousel_inner_w - (cr_cols - 1) * tile_gap) / cr_cols)
+
+    -- Carousel sizing — *natural*, not stretched.  We want Folders to sit
+    -- right under its heading; any extra vertical space flows to the bottom
+    -- pad instead of inflating the covers.  Cap cover height at a 1.55
+    -- aspect ratio (typical book cover) AND at whatever the height budget
+    -- can spare, whichever is smaller.
+    local reserved = top_pad
+                   + section_lbl_h + pre_section_gap                -- CR heading
+                   + tile_text_h + tile_pct_h + Screen:scaleBySize(8) -- tile extras
+                   + between_sections
+                   + section_lbl_h + pre_section_gap                -- Folders heading
+                   + button_h + UI.PAD + button_h                   -- 2 nav buttons
+                   + bot_pad
+    local cover_budget = content_h - reserved
+    local cover_h = math.min(math.floor(tile_w * 1.55 * cov_sc), cover_budget)
     if cover_h < Screen:scaleBySize(60) then cover_h = Screen:scaleBySize(60) end
+    local tile_h = cover_h + tile_text_h + tile_pct_h + Screen:scaleBySize(8)
 
     -- Current-reading books from cache.
     local cr_slot = Cache.get("currently_reading")
@@ -887,8 +919,8 @@ function BookFusionTab:_buildLanding(sw, content_h)
         right_arrow,
     }
 
-    -- Section label — deliberately subdued: small, non-bold, mid-grey.
-    -- It's a signpost, not a headline.
+    -- Section label — bold + small + mid-grey.  Used for both
+    -- "Currently Reading" and "Folders" so they read as peers.
     local SECTION_GRAY = Blitbuffer.gray(0.45)
     local function _sectionLabel(text, note)
         local face = Font:getFace("cfont", section_fs)
@@ -898,6 +930,7 @@ function BookFusionTab:_buildLanding(sw, content_h)
             TextWidget:new{
                 text    = display,
                 face    = face,
+                bold    = true,
                 fgcolor = SECTION_GRAY,
             },
         }
@@ -934,11 +967,23 @@ function BookFusionTab:_buildLanding(sw, content_h)
     local fav_count   = fav_slot and fav_slot.books and #fav_slot.books or nil
 
     -- Build the page layout.
+    --
+    -- Structure:
+    --   top_pad
+    --   "Currently Reading"   (heading)
+    --   pre_section_gap
+    --   carousel              (covers + progress + title)
+    --   between_sections
+    --   "Folders"             (heading)
+    --   pre_section_gap
+    --   [ To Be Read  › ]
+    --   UI.PAD
+    --   [ Favorites   › ]
+    --   bot_pad
     local vg = VerticalGroup:new{ align = "left" }
     vg[#vg+1] = VerticalSpan:new{ width = top_pad }
     vg[#vg+1] = _sectionLabel(_("Currently Reading"), cr_note)
-    -- Visual breathing room between the subtle label and the cover row.
-    vg[#vg+1] = VerticalSpan:new{ width = pre_carousel_gap }
+    vg[#vg+1] = VerticalSpan:new{ width = pre_section_gap }
     if #cr_books == 0 then
         -- First-time / after-clear-cache state.  We don't auto-sync (the tab
         -- is fully offline by spec), so nudge the user toward the refresh
@@ -966,7 +1011,9 @@ function BookFusionTab:_buildLanding(sw, content_h)
             carousel_row,
         }
     end
-    vg[#vg+1] = VerticalSpan:new{ width = mid_gap }
+    vg[#vg+1] = VerticalSpan:new{ width = between_sections }
+    vg[#vg+1] = _sectionLabel(_("Folders"))
+    vg[#vg+1] = VerticalSpan:new{ width = pre_section_gap }
     vg[#vg+1] = _navButton(_("To Be Read"),  tbr_count, function() self:_enterSubpage("tbr")       end)
     vg[#vg+1] = VerticalSpan:new{ width = UI.PAD }
     vg[#vg+1] = _navButton(_("Favorites"),   fav_count, function() self:_enterSubpage("favorites") end)
