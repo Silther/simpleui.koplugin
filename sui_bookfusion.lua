@@ -79,6 +79,7 @@ local SETK_COVER_SCALE = "navbar_bookfusion_cover_scale"  -- float, 0.6 .. 1.6
 local SETK_TEXT_SCALE  = "navbar_bookfusion_text_scale"   -- float, 0.6 .. 1.6
 local SETK_CR_COLS     = "navbar_bookfusion_cr_cols"      -- int,   2 .. 6
 local SETK_GRID_COLS   = "navbar_bookfusion_grid_cols"    -- int,   2 .. 6
+local SETK_GRID_ROWS   = "navbar_bookfusion_grid_rows"    -- int,   1 .. 6
 
 local function _clamp(v, lo, hi)
     if v < lo then return lo elseif v > hi then return hi end
@@ -96,6 +97,7 @@ function Settings.coverScale() return _readNum(SETK_COVER_SCALE, 1.0, 0.6, 1.6) 
 function Settings.textScale()  return _readNum(SETK_TEXT_SCALE,  1.0, 0.6, 1.6) end
 function Settings.crCols()     return math.floor(_readNum(SETK_CR_COLS,   3, 2, 6)) end
 function Settings.gridCols()   return math.floor(_readNum(SETK_GRID_COLS, 4, 2, 6)) end
+function Settings.gridRows()   return math.floor(_readNum(SETK_GRID_ROWS, 2, 1, 6)) end
 
 -- ===========================================================================
 -- 2. CACHE
@@ -404,7 +406,8 @@ end
 -- falls back to a typographic placeholder (first two chars of the title).
 -- ===========================================================================
 
-local COLOR_COVER_BORDER = Blitbuffer.gray(0.45)
+local COLOR_COVER_BORDER = Blitbuffer.COLOR_BLACK
+local COVER_BORDER_SIZE  = 2  -- px; bumped from 1 for a slightly stronger outline
 local COLOR_COVER_BG     = Blitbuffer.gray(0.95)
 -- Match module_currently's palette so the progress bar looks identical to
 -- the Home tab's Currently Reading card (module_currently.lua:47-49).
@@ -431,13 +434,14 @@ local function _coverPlaceholder(title, w, h)
     -- computes its size as content_size + 2*bordersize.)  Using `w × h` for
     -- the CenterContainer's dimen would make the placeholder 2px wider and
     -- 2px taller than a real cover, causing subtle misalignment.
+    local bw = COVER_BORDER_SIZE
     return FrameContainer:new{
-        bordersize = 1, color = COLOR_COVER_BORDER,
+        bordersize = bw, color = COLOR_COVER_BORDER,
         background = COLOR_COVER_BG,
         padding = 0, margin = 0,
         dimen = Geom:new{ w = w, h = h },
         CenterContainer:new{
-            dimen = Geom:new{ w = w - 2, h = h - 2 },
+            dimen = Geom:new{ w = w - 2 * bw, h = h - 2 * bw },
             TextWidget:new{
                 text = _firstChars(title or "?", 2):upper(),
                 face = Font:getFace("smallinfofont", Screen:scaleBySize(20)),
@@ -450,12 +454,19 @@ end
 -- Compute a best-fit scale factor from the BB's native dims (bb_w × bb_h)
 -- into the display box (max_w × max_h), preserving aspect.  Mirrors
 -- bf_listmenu.getCachedCoverSize (bookfusion.koplugin/bf_listmenu.lua:35-46).
+--
+-- fit_w is how wide the image would be if we scaled it to fill max_h.
+-- If that width still fits within max_w, we're height-constrained → scale
+-- by height (max_h / bb_h).  Otherwise we're width-constrained → scale by
+-- width (max_w / bb_w).  Earlier versions had a typo that returned the
+-- width-based factor in both branches, which let portrait covers overflow
+-- their tile_h and bleed into the row below.
 local function _bestFitScale(bb_w, bb_h, max_w, max_h)
     local fit_w = math.floor(max_h * bb_w / bb_h + 0.5)
     if max_w >= fit_w then
-        return max_w / bb_w  -- height-constrained
+        return max_h / bb_h   -- height is the limiting axis
     else
-        return max_w / bb_w  -- width-constrained (same formula; kept for clarity)
+        return max_w / bb_w   -- width is the limiting axis
     end
 end
 
@@ -465,9 +476,9 @@ end
 --
 -- Returns: widget, actual_w, actual_h  (actual_w/h = scaled image + 2*border)
 local function _coverImage(bb, bb_w, bb_h, box_w, box_h)
-    -- Inner box inside the 1px border.
-    local inner_w = box_w - 2
-    local inner_h = box_h - 2
+    -- Inner box inside the border on both sides.
+    local inner_w = box_w - 2 * COVER_BORDER_SIZE
+    local inner_h = box_h - 2 * COVER_BORDER_SIZE
     local scale   = _bestFitScale(bb_w, bb_h, inner_w, inner_h)
     local ok, img = pcall(function()
         local w = ImageWidget:new{
@@ -485,10 +496,11 @@ local function _coverImage(bb, bb_w, bb_h, box_w, box_h)
     -- Frame hugs the scaled image: no CenterContainer, no letterbox whitespace.
     -- Tile VerticalGroup(align="center") centers this frame + the progress bar
     -- within the tile column, keeping them perfectly stacked.
-    local actual_w = sz.w + 2  -- +2 for the 1px border on each side
-    local actual_h = sz.h + 2
+    local bw = COVER_BORDER_SIZE
+    local actual_w = sz.w + 2 * bw  -- border on both sides
+    local actual_h = sz.h + 2 * bw
     local frame = FrameContainer:new{
-        bordersize = 1, color = COLOR_COVER_BORDER,
+        bordersize = bw, color = COLOR_COVER_BORDER,
         padding = 0, margin = 0,
         dimen = Geom:new{ w = actual_w, h = actual_h },
         img,
@@ -1114,12 +1126,17 @@ function BookFusionTab:_buildSubpage(sw, content_h)
     local inner_w   = sw - 2 * UI.SIDE_PAD
     local txt_sc    = Settings.textScale()
     local cov_sc    = Settings.coverScale()
+    -- Grid geometry is now fully driven by settings: fixed `rows × cols`
+    -- per page, cover dimensions derived so the whole grid exactly fills
+    -- the available area.  Defaults are 2 rows × 4 cols = 8 covers per
+    -- page; both are clamped to 1..6 by the setting readers.
     local grid_cols = Settings.gridCols()
+    local rows      = Settings.gridRows()
 
     -- Pager bar (prev / page / next) pinned at the bottom of the subpage.
     -- The subpage's title + back arrow live in the main TitleBar now, so
     -- there's no sub-header eating vertical space here.
-    local pager_h = Screen:scaleBySize(36)
+    local pager_h = Screen:scaleBySize(32)
 
     local books
     if self._view == "tbr" then
@@ -1128,25 +1145,40 @@ function BookFusionTab:_buildSubpage(sw, content_h)
         local slot = Cache.get("favorites");       books = (slot and slot.books) or {}
     end
 
-    -- Compute tile dims from available area minus top gap + pager.
-    local grid_h = content_h - pager_h - UI.PAD * 2
-    local tile_gap = UI.PAD2
+    -- Vertical paddings used both to size the grid area and to position
+    -- the pager later on (see VG assembly below).  Declared once here so
+    -- there's a single source of truth.
+    local top_pad = Screen:scaleBySize(32)
+    local bot_pad = Screen:scaleBySize(12)
+    local grid_h  = content_h - top_pad - pager_h - bot_pad
+
+    -- Unified horizontal padding: the gap between covers matches the gap
+    -- between the outermost covers and the screen edge (the FrameContainer
+    -- at the bottom of this function uses padding_left/right = UI.SIDE_PAD).
+    local tile_gap = UI.SIDE_PAD
     local row_gap  = UI.PAD
-    local tile_w = math.floor((inner_w - (grid_cols - 1) * tile_gap) / grid_cols)
+
     -- Subpage tiles show a 1-line title.  Reserve just one actual line of
     -- the rendered face height (same formula as _titleLabel uses) plus a
-    -- few px of rounding margin — lets more rows fit per grid page than
-    -- the old 2-line reservation did.
+    -- few px of rounding margin.
     local _sub_title_fs   = math.max(6, math.floor(Screen:scaleBySize(6) * txt_sc))
     local _sub_title_face = Font:getFace("cfont", _sub_title_fs)
     local _sub_title_lh   = math.floor((1 + 0.3) * _sub_title_face.size + 0.5)
     local title_h_reserve = _sub_title_lh + Screen:scaleBySize(3)
-    -- How many rows fit in grid_h given tile_w + aspect + title?
-    -- Work out tile_h first:
-    local cover_h = math.floor(tile_w * 1.5 * cov_sc)
-    local tile_h  = cover_h + Screen:scaleBySize(4) + title_h_reserve
-    local rows = math.max(1, math.floor((grid_h + row_gap) / (tile_h + row_gap)))
-    if rows < 1 then rows = 1 end
+    local cover_title_gap = Screen:scaleBySize(4)
+
+    -- Tile dimensions derived from the configured rows × cols.
+    local tile_w = math.floor((inner_w - (grid_cols - 1) * tile_gap) / grid_cols)
+    -- Vertical budget per tile: total grid_h minus inter-row gaps, divided
+    -- evenly across `rows`.  Cover_h gets whatever is left after the title
+    -- strip.  If the budget isn't enough for a sensible cover, we fall
+    -- back to a 1.5:1 aspect ratio on tile_w (scaled by cover_scale).
+    local tile_budget_h  = math.floor((grid_h - (rows - 1) * row_gap) / rows)
+    local cover_h        = tile_budget_h - title_h_reserve - cover_title_gap
+    local aspect_cover_h = math.floor(tile_w * 1.5 * cov_sc)
+    if cover_h > aspect_cover_h then cover_h = aspect_cover_h end
+    if cover_h < Screen:scaleBySize(60) then cover_h = Screen:scaleBySize(60) end
+    local tile_h  = cover_h + cover_title_gap + title_h_reserve
     local per_page = rows * grid_cols
 
     local total_pages = math.max(1, math.ceil(#books / per_page))
@@ -1201,39 +1233,72 @@ function BookFusionTab:_buildSubpage(sw, content_h)
         }
     end
 
-    -- Pager: "‹  Page X / Y  ›" — same flash behaviour as the carousel arrows.
-    local function _pagerArrow(icon, enabled, cb)
-        if not enabled then return HorizontalSpan:new{ width = Screen:scaleBySize(32) } end
-        return IconButton:new{
-            icon = icon,
-            width = Screen:scaleBySize(32), height = Screen:scaleBySize(32),
-            padding = 0,
-            callback = cb, show_parent = self,
+    -- Pager: subdued "X/Y" centred, arrows pinned to the edges.
+    -- OverlapGroup lets each child anchor independently (left / center /
+    -- right via overlap_align) inside the same footprint.  Each child is
+    -- then wrapped in a CenterContainer of the same height as the pager
+    -- so overlap_align (horizontal) + CenterContainer (vertical) combine
+    -- into a proper 2-axis anchoring.
+    local arrow_sz = Screen:scaleBySize(30)
+    local function _pagerArrow(icon, enabled, cb, side)
+        local inner
+        if enabled then
+            inner = IconButton:new{
+                icon        = icon,
+                width       = arrow_sz,
+                height      = arrow_sz,
+                padding     = 0,
+                callback    = cb,
+                show_parent = self,
+            }
+        else
+            -- Keep the footprint so the text stays centred even at the edges.
+            inner = HorizontalSpan:new{ width = arrow_sz }
+        end
+        return CenterContainer:new{
+            dimen         = Geom:new{ w = arrow_sz, h = pager_h },
+            overlap_align = side,
+            inner,
         }
     end
-    local pager = HorizontalGroup:new{ align = "center",
-        _pagerArrow("chevron.left",  self._grid_page > 1,           function() self:_cyclePage(-1) end),
-        HorizontalSpan:new{ width = UI.PAD },
-        TextWidget:new{
-            text = string.format(_("Page %d / %d"), self._grid_page, total_pages),
-            face = Font:getFace("cfont", math.max(10, math.floor(Screen:scaleBySize(11) * txt_sc))),
+    local pager_fs = math.max(6, math.floor(Screen:scaleBySize(7) * txt_sc))
+    local pager_label = TextWidget:new{
+        text    = string.format("%d / %d", self._grid_page, total_pages),
+        face    = Font:getFace("cfont", pager_fs),
+        fgcolor = Blitbuffer.gray(0.45),   -- subtle mid-grey
+    }
+    local pager = OverlapGroup:new{
+        dimen = Geom:new{ w = inner_w, h = pager_h },
+        _pagerArrow("chevron.left",  self._grid_page > 1,           function() self:_cyclePage(-1) end, "left"),
+        CenterContainer:new{
+            dimen         = Geom:new{ w = inner_w, h = pager_h },
+            overlap_align = "center",
+            pager_label,
         },
-        HorizontalSpan:new{ width = UI.PAD },
-        _pagerArrow("chevron.right", self._grid_page < total_pages, function() self:_cyclePage( 1) end),
+        _pagerArrow("chevron.right", self._grid_page < total_pages, function() self:_cyclePage( 1) end, "right"),
     }
 
-    -- Top pad MUST be ≥ icon_size so the first grid row sits below the
-    -- title bar's IconButton extended tap zones (padding_bottom = icon_size;
-    -- titlebar.lua:381/388).  Otherwise the back-arrow or refresh-icon tap
-    -- zone would swallow taps on the top row of covers.
+    -- Layout: grid at top (with top_pad clearing the title-bar icon tap
+    -- zones), then a flexible VerticalSpan that absorbs whatever vertical
+    -- slack is left, then the pager pinned near the content-area bottom
+    -- with its own trailing pad.
+    --
+    -- The flex_pad must be computed from the **actual** rows we placed
+    -- (variable `placed` from the build loop above), not the `rows`
+    -- budget — otherwise a short last page (e.g. only 1 row of books) is
+    -- measured as if it had `rows` full rows, so flex_pad underestimates
+    -- the slack and the pager floats well above the bottom.  top_pad /
+    -- bot_pad were defined at the top of this function.
+    local grid_h_actual = placed * tile_h + math.max(0, placed - 1) * row_gap
+    local used_h = top_pad + grid_h_actual + pager_h + bot_pad
+    local flex_pad = math.max(Screen:scaleBySize(4), content_h - used_h)
+
     local vg = VerticalGroup:new{ align = "left" }
-    vg[#vg+1] = VerticalSpan:new{ width = Screen:scaleBySize(32) }
+    vg[#vg+1] = VerticalSpan:new{ width = top_pad }
     vg[#vg+1] = grid
-    vg[#vg+1] = VerticalSpan:new{ width = UI.PAD }
-    vg[#vg+1] = CenterContainer:new{
-        dimen = Geom:new{ w = inner_w, h = pager_h },
-        pager,
-    }
+    vg[#vg+1] = VerticalSpan:new{ width = flex_pad }
+    vg[#vg+1] = pager
+    vg[#vg+1] = VerticalSpan:new{ width = bot_pad }
 
     return FrameContainer:new{
         bordersize = 0, margin = 0,
