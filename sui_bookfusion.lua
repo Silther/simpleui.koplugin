@@ -322,7 +322,7 @@ end
 -- cut round-trips; 200-page safety belt just in case.
 local FETCH_PER_PAGE = 50
 
-function Data.fetchListAll(params, cb)
+function Data.fetchListAll(params, cb, opts)
     local api = Data.api()
     if not api then if cb then cb(false, "api_unavailable") end; return end
     UIManager:scheduleIn(0, function()
@@ -341,6 +341,34 @@ function Data.fetchListAll(params, cb)
             page = page + 1
             if page > 200 then break end
         end
+
+        -- Optional progress enrichment: `/books/search` doesn't return
+        -- reading progress (only book metadata), so when the caller needs
+        -- it (e.g. Currently Reading) we follow up with one
+        -- `api:getReadingPosition(id)` per book and attach `.percentage`
+        -- as a 0..1 fraction (server sends 0..100.0000).  404 is
+        -- whitelisted inside bf_api → (ok=true, data=nil) meaning "no
+        -- remote position yet" → we simply leave percentage nil.
+        --
+        -- Cost: N serial HTTP GETs.  Acceptable for Currently Reading
+        -- (usually ≤10 books); don't enable this for TBR / Favourites
+        -- where we wouldn't render the bar anyway.
+        if opts and opts.with_progress then
+            for i = 1, #all do
+                local b = all[i]
+                if b and b.id then
+                    local ok_p, pos = pcall(function()
+                        local ok_r, data = api:getReadingPosition(b.id)
+                        return ok_r and data or nil
+                    end)
+                    if ok_p and type(pos) == "table" then
+                        local pct = tonumber(pos.percentage)
+                        if pct then b.percentage = pct / 100 end
+                    end
+                end
+            end
+        end
+
         if cb then cb(true, all) end
     end)
 end
@@ -1792,6 +1820,11 @@ function BookFusionTab:_refreshLists(force)
             if idx > #pending then finish(); return end
             local key = pending[idx]
             local params = Cache.LIST_PARAMS[key] or { list = key }
+            -- Enrich only Currently Reading with per-book reading position:
+            -- that's the only list whose tiles render a progress bar.  TBR /
+            -- Favourites would pay N extra HTTP GETs for data we'd throw
+            -- away in `BookTile:init` (show_progress = false on those views).
+            local fetch_opts = { with_progress = (key == "currently_reading") }
             Data.fetchListAll(params, function(ok, books)
                 if ok and type(books) == "table" then
                     Cache.put(key, books)
@@ -1802,7 +1835,7 @@ function BookFusionTab:_refreshLists(force)
                 if self._closed then return end
                 self:_rebuildAndRepaint()
                 step()
-            end)
+            end, fetch_opts)
         end
         step()
     end)
