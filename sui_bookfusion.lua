@@ -903,25 +903,35 @@ end
 -- so the icons have visible breathing room from the screen edges.
 function BookFusionTab:_buildTitleBar()
     local on_landing = (self._view == "landing")
-    local title, left_icon, left_cb
+    -- Title always reads "BookFusion" (app name — same pattern as the FM's
+    -- fixed "Library" title).  The subtitle carries the navigation
+    -- context: "Plan to Read" / "Favorites" / "Search: <query>", and is
+    -- empty on the landing view.  Keeping the app name fixed at the top
+    -- makes the tab feel consistent across drill-downs.
+    local title = _("BookFusion")
+    local subtitle, left_icon, left_cb
     if on_landing then
-        title     = _("BookFusion")
+        -- Landing has no navigation context to display, so leave the
+        -- subtitle unset (nil skips TitleBar's subtitle widget entirely —
+        -- titlebar.lua:207).  Net effect: landing gets a shorter title
+        -- bar than the subpage views, same as the FM when no path is set.
+        subtitle  = nil
         left_icon = "appbar.search"
         left_cb   = function() self:_onLeftIcon() end
     elseif self._view == "tbr" then
-        title     = _("Plan to Read")
+        subtitle  = _("Plan to Read")
         left_icon = "chevron.left"
         left_cb   = function() self:_exitSubpage() end
     elseif self._view == "search" then
-        -- Long queries: truncate so the title bar stays single-line.  The
+        -- Long queries: truncate so the subtitle stays single-line.  The
         -- full query stays in self._search_query for the re-search flow.
         local q = self._search_query or ""
         if #q > 24 then q = q:sub(1, 23) .. "…" end
-        title     = string.format(_("Search: %s"), q)
+        subtitle  = string.format(_("Search: %s"), q)
         left_icon = "chevron.left"
         left_cb   = function() self:_exitSearch() end
     else
-        title     = _("Favorites")
+        subtitle  = _("Favorites")
         left_icon = "chevron.left"
         left_cb   = function() self:_exitSubpage() end
     end
@@ -935,12 +945,10 @@ function BookFusionTab:_buildTitleBar()
         -- auto-compute at titlebar.lua:182-200 baseline-aligns title with
         -- icons, yielding a shorter bar that looks different from the FM.
         title_top_padding        = Screen:scaleBySize(6),
-        -- Empty-but-present subtitle forces TitleBar to reserve the
-        -- subtitle's vertical slot (titlebar.lua:207 treats "" as truthy),
-        -- adding the extra bottom block that gives the FM title bar its
-        -- characteristic height.  Without this, our bar is shorter than
-        -- the Library tab even with matching title_top_padding.
-        subtitle                 = "",
+        -- Subtitle carries the navigation context (folder name / search
+        -- query).  `nil` on landing (no context to show, no subtitle
+        -- slot reserved → shorter bar); non-empty on drill-down views.
+        subtitle                 = subtitle,
         -- Match FileManager (filemanager.lua:129): 5 px button padding so
         -- icons sit the same distance from the screen edge and the hit
         -- rects are the same size as the Library tab's.  Earlier this was
@@ -1373,7 +1381,7 @@ function BookFusionTab:_buildSubpage(sw, content_h)
     -- Vertical paddings used both to size the grid area and to position
     -- the pager later on (see VG assembly below).  Declared once here so
     -- there's a single source of truth.
-    local top_pad = Screen:scaleBySize(32)
+    local top_pad = Screen:scaleBySize(12)
     local bot_pad = Screen:scaleBySize(12)
     local grid_h  = content_h - top_pad - pager_h - bot_pad
 
@@ -1571,6 +1579,15 @@ function BookFusionTab:_rebuildAndRepaint()
         self.title_bar    = new_tb
         self._body_vg[1]  = new_tb
         self._body_vg[2]  = self:_buildBodyContent()
+        -- VerticalGroup caches _size and _offsets on first getSize() call
+        -- (verticalgroup.lua:15-31).  Mutating slots in place leaves the
+        -- cached offsets pointing at the PREVIOUS children's positions,
+        -- so paintTo draws the new body at the old title bar's y — which
+        -- now that the title bar changes height between landing (no
+        -- subtitle) and subpages (with subtitle) produces a top overlap
+        -- and a bottom gap.  resetLayout() clears the cache so offsets
+        -- are recomputed from the fresh children on the next paint.
+        self._body_vg:resetLayout()
     end
     -- Dithering hint for e-ink refreshes.  Without this, the first paint
     -- after a cover lands on screen uses a bi-level refresh that crushes
