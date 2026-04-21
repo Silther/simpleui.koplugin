@@ -1975,8 +1975,12 @@ end
 
 -- Back gesture closes the tab to the FM underneath.  Inside a subpage, the
 -- first Back returns to landing; second Back closes.
+-- Tab switches (via sui_bottombar.M.navigate) set _navbar_closing_intentionally
+-- before invoking onClose and expect a full close regardless of subpage state —
+-- otherwise the tab stays on the stack, covering the FM, and the user has to
+-- tap the library tab twice.
 function BookFusionTab:onClose()
-    if self._view ~= "landing" then
+    if not self._navbar_closing_intentionally and self._view ~= "landing" then
         self:_exitSubpage()
         return true
     end
