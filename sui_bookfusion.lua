@@ -187,14 +187,18 @@ function Cache.put(k, books)
                 -- re-traverse the nested table on every paint.
                 local cover = b.cover
                 slim[#slim + 1] = {
-                    id         = b.id,
-                    title      = b.title,
-                    authors    = b.authors,
-                    cover_url  = cover and cover.url    or b.cover_url,
-                    cover_w    = cover and cover.width  or b.cover_w,
-                    cover_h    = cover and cover.height or b.cover_h,
-                    percentage = b.percentage,
-                    format     = b.format,
+                    id            = b.id,
+                    title         = b.title,
+                    authors       = b.authors,
+                    cover_url     = cover and cover.url    or b.cover_url,
+                    cover_w       = cover and cover.width  or b.cover_w,
+                    cover_h       = cover and cover.height or b.cover_h,
+                    percentage    = b.percentage,
+                    format        = b.format,
+                    -- Preserved so bf_downloader.downloadBook can render its
+                    -- "13.0 MB" subtitle and drive the progress bar — without
+                    -- it the popup degrades to just a "Downloading …" line.
+                    download_size = b.download_size,
                 }
             end
         end
@@ -1671,14 +1675,16 @@ function BookFusionTab:_fetchNextSearchPage(on_done)
             if type(b) == "table" and b.id then
                 local cover = b.cover
                 self._search_results[#self._search_results + 1] = {
-                    id         = b.id,
-                    title      = b.title,
-                    authors    = b.authors,
-                    cover_url  = cover and cover.url    or b.cover_url,
-                    cover_w    = cover and cover.width  or b.cover_w,
-                    cover_h    = cover and cover.height or b.cover_h,
-                    percentage = b.percentage,
-                    format     = b.format,
+                    id            = b.id,
+                    title         = b.title,
+                    authors       = b.authors,
+                    cover_url     = cover and cover.url    or b.cover_url,
+                    cover_w       = cover and cover.width  or b.cover_w,
+                    cover_h       = cover and cover.height or b.cover_h,
+                    percentage    = b.percentage,
+                    format        = b.format,
+                    -- See Cache.put: preserved for bf_downloader's progress UI.
+                    download_size = b.download_size,
                 }
             end
         end
