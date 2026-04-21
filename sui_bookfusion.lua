@@ -75,11 +75,16 @@ M._instance = nil
 
 local Settings = {}
 
-local SETK_COVER_SCALE = "navbar_bookfusion_cover_scale"  -- float, 0.6 .. 1.6
-local SETK_TEXT_SCALE  = "navbar_bookfusion_text_scale"   -- float, 0.6 .. 1.6
-local SETK_CR_COLS     = "navbar_bookfusion_cr_cols"      -- int,   2 .. 6
-local SETK_GRID_COLS   = "navbar_bookfusion_grid_cols"    -- int,   2 .. 6
-local SETK_GRID_ROWS   = "navbar_bookfusion_grid_rows"    -- int,   1 .. 6
+local SETK_COVER_SCALE      = "navbar_bookfusion_cover_scale"       -- float, 0.6 .. 1.6
+local SETK_TEXT_SCALE       = "navbar_bookfusion_text_scale"        -- float, 0.6 .. 1.6
+local SETK_CR_COLS          = "navbar_bookfusion_cr_cols"           -- int,   2 .. 6
+local SETK_GRID_COLS        = "navbar_bookfusion_grid_cols"         -- int,   2 .. 6
+local SETK_GRID_ROWS        = "navbar_bookfusion_grid_rows"         -- int,   1 .. 6
+-- Search fetch floor: target min books per API call for in-place search.
+-- Actual fetch_size rounds up to the nearest multiple of the display grid
+-- (grid_rows × grid_cols) so every fetch ends on a clean display-page
+-- boundary.  Hidden knob — not exposed in a settings UI.
+local SETK_SEARCH_MIN_FETCH = "navbar_bookfusion_search_min_fetch"  -- int,   8 .. 100
 
 local function _clamp(v, lo, hi)
     if v < lo then return lo elseif v > hi then return hi end
@@ -93,11 +98,22 @@ local function _readNum(key, default, lo, hi)
     return _clamp(n, lo, hi)
 end
 
-function Settings.coverScale() return _readNum(SETK_COVER_SCALE, 1.0, 0.6, 1.6) end
-function Settings.textScale()  return _readNum(SETK_TEXT_SCALE,  1.0, 0.6, 1.6) end
-function Settings.crCols()     return math.floor(_readNum(SETK_CR_COLS,   3, 2, 6)) end
-function Settings.gridCols()   return math.floor(_readNum(SETK_GRID_COLS, 4, 2, 6)) end
-function Settings.gridRows()   return math.floor(_readNum(SETK_GRID_ROWS, 2, 1, 6)) end
+function Settings.coverScale()     return _readNum(SETK_COVER_SCALE,     1.0, 0.6, 1.6) end
+function Settings.textScale()      return _readNum(SETK_TEXT_SCALE,      1.0, 0.6, 1.6) end
+function Settings.crCols()         return math.floor(_readNum(SETK_CR_COLS,          3,  2,   6)) end
+function Settings.gridCols()       return math.floor(_readNum(SETK_GRID_COLS,        4,  2,   6)) end
+function Settings.gridRows()       return math.floor(_readNum(SETK_GRID_ROWS,        2,  1,   6)) end
+function Settings.searchMinFetch() return math.floor(_readNum(SETK_SEARCH_MIN_FETCH, 20, 8, 100)) end
+
+-- Derived: books per API call for the current search session.
+-- Rounds `searchMinFetch()` up to the nearest multiple of the display grid,
+-- so every fetched chunk ends on a display-page boundary — we never show
+-- "last row has 3 of 8 slots filled, tap › to get the rest".
+function Settings.searchFetchSize(per_display_page)
+    if not per_display_page or per_display_page < 1 then per_display_page = 1 end
+    local min_fetch = Settings.searchMinFetch()
+    return math.max(1, math.ceil(min_fetch / per_display_page)) * per_display_page
+end
 
 -- ===========================================================================
 -- 2. CACHE
@@ -318,6 +334,31 @@ function Data.fetchListAll(params, cb)
     end)
 end
 
+-- Single-page search fetch.
+--
+-- Used by the in-place search flow, which — unlike `fetchListAll` — needs
+-- to paginate ONE page at a time so the first results paint as soon as
+-- possible and we don't over-fetch when the user only looks at page 1.
+--
+-- cb signature: `cb(ok, books, pagination)`
+--   books      = Book[] (array) for this API page
+--   pagination = { page, per_page, total } from the response headers
+-- Deferred via scheduleIn(0, ...) so the caller's UI update (popup, etc.)
+-- can paint before the HTTP round-trip blocks.
+function Data.searchPage(query, api_page, per_page, cb)
+    local api = Data.api()
+    if not api then if cb then cb(false, "api_unavailable") end; return end
+    UIManager:scheduleIn(0, function()
+        local ok, books, pagination = api:searchBooks({
+            query    = query,
+            page     = api_page,
+            per_page = per_page,
+        })
+        if not ok then if cb then cb(false, books) end; return end
+        if cb then cb(true, books, pagination) end
+    end)
+end
+
 -- ===========================================================================
 -- 4. COVERS
 -- ---------------------------------------------------------------------------
@@ -328,11 +369,19 @@ end
 --       package.path) → decode + return
 --   L2: HTTP fetch via bf_image_loader (async, Trapper subprocess) → on
 --       success, write to disk cache and fire callback to repaint.
+--
+-- TODO (cover loading reliability): bf_image_loader uses Trapper's
+-- `dismissableRunInSubprocess`, so any user input during a sync kills the
+-- in-flight download and the URL stays un-cached.  If the user keeps tapping
+-- across refreshes, the same covers never land on disk and stay as
+-- placeholders.  Needs a fix later — either make the sync non-dismissable,
+-- or retry the dismissed URLs automatically on the next _prefetchVisibleCovers
+-- pass instead of relying on the user to trigger another manual refresh.
 -- ===========================================================================
 
 local Covers = {}
 
-local _bb_cache = {}  -- key = url  → { bb, w, h }  (BB + its API-reported dims)
+local _bb_cache = {}  -- key = url  → { bb, w, h }
 
 -- Try L0 + L1 synchronously; never triggers network.
 -- We decode at the API-reported cover_w × cover_h (mirroring bf_listmenu:546-548).
@@ -352,17 +401,35 @@ function Covers.getBB(url, api_w, api_h)
     local ok_ri, RenderImage = pcall(require, "ui/renderimage")
     if not ok_ri or not RenderImage then return nil end
 
-    -- Fall back to a reasonable default if the API didn't supply dims
-    -- (typical book cover aspect ≈ 2:3).
-    local w = tonumber(api_w) or 400
-    local h = tonumber(api_h) or 600
+    -- Fall back to a reasonable default if the API didn't supply dims OR
+    -- supplied something invalid (0, negative, or non-number).  Some books
+    -- in the BookFusion catalogue really do ship with cover.width = 0 in
+    -- the API response; `tonumber()` alone doesn't catch that, and passing
+    -- 0 to scaleBlitBuffer produces a zero-pixel BB that paints solid black.
+    local w = tonumber(api_w)
+    local h = tonumber(api_h)
+    if not w or w <= 0 then w = 400 end
+    if not h or h <= 0 then h = 600 end
+
     local ok, new_bb = pcall(function()
         return RenderImage:renderImageData(data, #data, false, w, h)
     end)
     if not ok or not new_bb then return nil end
     new_bb:setAllocated(1)
-    _bb_cache[url] = { bb = new_bb, w = w, h = h }
-    return new_bb, w, h
+
+    -- Use the BB's ACTUAL dimensions, not the values we asked for.  The
+    -- decoders don't all honour the hint exactly (MuPDF / WebP / GifLib
+    -- can return slightly different sizes), and downstream _bestFitScale
+    -- needs the real dims to compute a correct scale factor.
+    local actual_w = new_bb:getWidth()  or w
+    local actual_h = new_bb:getHeight() or h
+    if actual_w <= 0 or actual_h <= 0 then
+        pcall(function() new_bb:free() end)
+        return nil
+    end
+
+    _bb_cache[url] = { bb = new_bb, w = actual_w, h = actual_h }
+    return new_bb, actual_w, actual_h
 end
 
 -- Kick off async fetch for each url not yet on disk.  `on_done(url)` fires on
@@ -759,6 +826,14 @@ function BookFusionTab:_buildTitleBar()
         title     = _("Plan to Read")
         left_icon = "chevron.left"
         left_cb   = function() self:_exitSubpage() end
+    elseif self._view == "search" then
+        -- Long queries: truncate so the title bar stays single-line.  The
+        -- full query stays in self._search_query for the re-search flow.
+        local q = self._search_query or ""
+        if #q > 24 then q = q:sub(1, 23) .. "…" end
+        title     = string.format(_("Search: %s"), q)
+        left_icon = "chevron.left"
+        left_cb   = function() self:_exitSearch() end
     else
         title     = _("Favorites")
         left_icon = "chevron.left"
@@ -1138,11 +1213,25 @@ function BookFusionTab:_buildSubpage(sw, content_h)
     -- there's no sub-header eating vertical space here.
     local pager_h = Screen:scaleBySize(32)
 
-    local books
-    if self._view == "tbr" then
-        local slot = Cache.get("planned_to_read"); books = (slot and slot.books) or {}
+    -- Book source depends on the view:
+    --   • tbr / favorites : pulled from the on-disk Cache (offline reads).
+    --   • search          : in-memory self._search_results, appended to by
+    --                       _fetchNextSearchPage as the user pages past what
+    --                       we've buffered.  `books_total` is the authoritative
+    --                       pager total — for cached lists it equals #books,
+    --                       for search it comes from the API's total-count
+    --                       header (self._search_total) so the pager shows
+    --                       a correct "N / M" from the first render onward.
+    local books, books_total
+    if self._view == "search" then
+        books       = self._search_results or {}
+        books_total = math.max(self._search_total or 0, #books)
+    elseif self._view == "tbr" then
+        local slot  = Cache.get("planned_to_read"); books = (slot and slot.books) or {}
+        books_total = #books
     else
-        local slot = Cache.get("favorites");       books = (slot and slot.books) or {}
+        local slot  = Cache.get("favorites");       books = (slot and slot.books) or {}
+        books_total = #books
     end
 
     -- Vertical paddings used both to size the grid area and to position
@@ -1181,11 +1270,15 @@ function BookFusionTab:_buildSubpage(sw, content_h)
     local tile_h  = cover_h + cover_title_gap + title_h_reserve
     local per_page = rows * grid_cols
 
-    local total_pages = math.max(1, math.ceil(#books / per_page))
+    local total_pages = math.max(1, math.ceil(books_total / per_page))
     if self._grid_page > total_pages then self._grid_page = total_pages end
     if self._grid_page < 1 then self._grid_page = 1 end
 
     local start_idx = (self._grid_page - 1) * per_page + 1
+    -- end_idx uses #books (not books_total) — the search view may declare
+    -- more total pages than it has buffered right now, and we can only
+    -- render books we actually have.  _cyclePage triggers a fetch before
+    -- showing a page that would otherwise be empty.
     local end_idx   = math.min(#books, start_idx + per_page - 1)
 
     -- Build grid rows.
@@ -1222,14 +1315,31 @@ function BookFusionTab:_buildSubpage(sw, content_h)
         end
     end
     if #grid == 0 then
-        grid[#grid+1] = LeftContainer:new{
-            dimen = Geom:new{ w = inner_w, h = tile_h },
-            TextBoxWidget:new{
-                text = _("No books in this list."),
-                face = Font:getFace("cfont",
-                    math.max(10, math.floor(Screen:scaleBySize(11) * txt_sc))),
-                width = inner_w,
-            },
+        -- Empty-state copy differs by view.  During the first search fetch
+        -- (no results yet AND no completed API page) we say "Searching…"
+        -- so the user gets immediate feedback even if the "Searching…"
+        -- InfoMessage popup fired too quickly to notice.
+        local empty_text
+        if self._view == "search" then
+            if self._search_fetching or self._search_api_page == 0 then
+                empty_text = _("Searching…")
+            else
+                empty_text = _("No books match your search.")
+            end
+        else
+            empty_text = _("No books in this list.")
+        end
+        -- Drop the TextBoxWidget straight into the grid VG (no LeftContainer
+        -- wrapper with h = tile_h).  LeftContainer vertically CENTRES its
+        -- child within its dimen (leftcontainer.lua:23), which pushed the
+        -- empty-state text to roughly the middle of the first tile row —
+        -- awkward during "Searching…".  TextBoxWidget sizes itself to its
+        -- text so it sits flush at the top of the grid area.
+        grid[#grid+1] = TextBoxWidget:new{
+            text  = empty_text,
+            face  = Font:getFace("cfont",
+                math.max(10, math.floor(Screen:scaleBySize(11) * txt_sc))),
+            width = inner_w,
         }
     end
 
@@ -1343,7 +1453,33 @@ function BookFusionTab:_cycleCarousel(delta)
 end
 
 function BookFusionTab:_cyclePage(delta)
-    self._grid_page = self._grid_page + delta
+    local new_page = self._grid_page + delta
+
+    -- In the search view, tapping › past the last fully-buffered display
+    -- page needs an API round-trip.  Buffer only as much as the user has
+    -- navigated to — no speculative prefetch.
+    if self._view == "search" and delta > 0 then
+        local per_page = Settings.gridRows() * Settings.gridCols()
+        local needed   = new_page * per_page
+        local have     = self._search_results and #self._search_results or 0
+        local server_total = self._search_total or 0
+        if have < needed and (server_total == 0 or have < server_total) then
+            -- Fetch another API page, then advance, repaint, and queue
+            -- cover downloads for the newly-visible books.
+            NetworkMgr:runWhenOnline(function()
+                if self._closed or self._view ~= "search" then return end
+                self:_fetchNextSearchPage(function()
+                    if self._closed or self._view ~= "search" then return end
+                    self._grid_page = new_page
+                    self:_rebuildAndRepaint()
+                    self:_prefetchVisibleCovers()
+                end)
+            end)
+            return
+        end
+    end
+
+    self._grid_page = new_page
     self:_rebuildAndRepaint()
 end
 
@@ -1361,9 +1497,165 @@ function BookFusionTab:_exitSubpage()
     self:_rebuildAndRepaint()
 end
 
+-- ---------------------------------------------------------------------------
+-- In-place search
+-- ---------------------------------------------------------------------------
+-- User-initiated and session-scoped (search inherently can't be offline —
+-- it's the one place in the tab that ALWAYS hits the network, by design):
+--   • An API call only fires when the user explicitly submits a query
+--     (no auto-search on tab open, no live-as-you-type debounce).
+--   • Results live in self._search_results (module-local Lua array).
+--   • No Cache.put — nothing persists across the tab's lifetime; a fresh
+--     query always pulls fresh data from the server.
+--   • Each API call fetches a page sized to the display grid (see
+--     Settings.searchFetchSize) so the buffer always ends on a whole
+--     display-page boundary.
+--   • total_display_pages comes from the API's total-count header on the
+--     FIRST response — the pager shows a correct "N / M" immediately, no
+--     "+" suffix or later renumbering.
+--   • Additional API pages are fetched on-demand when the user taps › past
+--     what's currently buffered.
+
+function BookFusionTab:_showSearchDialog()
+    local InputDialog = require("ui/widget/inputdialog")
+    local dialog
+    dialog = InputDialog:new{
+        title   = _("Search BookFusion"),
+        input   = self._search_query or "",
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    id   = "close",
+                    callback = function() UIManager:close(dialog) end,
+                },
+                {
+                    text = _("Search"),
+                    is_enter_default = true,
+                    callback = function()
+                        local q = dialog:getInputText() or ""
+                        q = q:gsub("^%s+", ""):gsub("%s+$", "")
+                        UIManager:close(dialog)
+                        if q == "" then return end
+                        self:_enterSearch(q)
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
+function BookFusionTab:_enterSearch(query)
+    -- Reset session state.
+    self._search_query        = query
+    self._search_results      = {}
+    self._search_total        = 0
+    self._search_api_page     = 0   -- 0 = nothing fetched yet
+    self._search_api_per_page = Settings.searchFetchSize(
+        Settings.gridRows() * Settings.gridCols())
+    self._search_fetching     = nil
+    self._grid_page           = 1
+
+    -- Show the view immediately (empty-state "Searching…" branch) so the
+    -- title bar swap is visible before network kicks in.
+    self._view = "search"
+    self:_rebuildAndRepaint()
+
+    -- Kick the first API fetch (deferred so the rebuild paints first).
+    NetworkMgr:runWhenOnline(function()
+        if self._closed or self._view ~= "search" then return end
+        self:_fetchNextSearchPage(function()
+            if self._closed or self._view ~= "search" then return end
+            self:_rebuildAndRepaint()
+            self:_prefetchVisibleCovers()
+        end)
+    end)
+end
+
+function BookFusionTab:_fetchNextSearchPage(on_done)
+    if self._search_fetching then return end
+    if not self._search_query or self._search_query == "" then return end
+    -- Stop if we've already fetched everything the server has.
+    if self._search_total > 0 and #self._search_results >= self._search_total then
+        if on_done then on_done() end
+        return
+    end
+    self._search_fetching = true
+
+    local InfoMessage = require("ui/widget/infomessage")
+    local popup = InfoMessage:new{ text = _("Searching…"), timeout = 0 }
+    self._search_popup = popup
+    UIManager:show(popup)
+
+    local next_api_page = self._search_api_page + 1
+    Data.searchPage(self._search_query, next_api_page,
+        self._search_api_per_page, function(ok, books, pagination)
+        self._search_fetching = false
+        if self._search_popup then
+            pcall(function() UIManager:close(self._search_popup) end)
+            self._search_popup = nil
+        end
+        if self._closed or self._view ~= "search" then return end
+        if not ok or type(books) ~= "table" then
+            logger.warn("simpleui-bf: search fetch failed:", tostring(books))
+            UIManager:show(InfoMessage:new{
+                text    = _("Couldn't search BookFusion."),
+                timeout = 3,
+            })
+            if on_done then on_done() end
+            return
+        end
+        -- Flatten each raw API book into the same slim shape Cache.put
+        -- stores for the cached lists (nested `cover = {url, width, height}`
+        -- → flat cover_url / cover_w / cover_h).  BookTile + Covers.getBB
+        -- expect the flat shape; without this, every search result rendered
+        -- as a placeholder because cover_url was always nil.
+        for i = 1, #books do
+            local b = books[i]
+            if type(b) == "table" and b.id then
+                local cover = b.cover
+                self._search_results[#self._search_results + 1] = {
+                    id         = b.id,
+                    title      = b.title,
+                    authors    = b.authors,
+                    cover_url  = cover and cover.url    or b.cover_url,
+                    cover_w    = cover and cover.width  or b.cover_w,
+                    cover_h    = cover and cover.height or b.cover_h,
+                    percentage = b.percentage,
+                    format     = b.format,
+                }
+            end
+        end
+        self._search_api_page = next_api_page
+        if pagination and pagination.total then
+            self._search_total = pagination.total
+        end
+        if on_done then on_done() end
+    end)
+end
+
+function BookFusionTab:_exitSearch()
+    -- Cancel an in-flight popup if any.
+    if self._search_popup then
+        pcall(function() UIManager:close(self._search_popup) end)
+        self._search_popup = nil
+    end
+    self._search_query        = nil
+    self._search_results      = nil
+    self._search_total        = 0
+    self._search_api_page     = 0
+    self._search_api_per_page = 0
+    self._search_fetching     = nil
+    self._view                = "landing"
+    self:_rebuildAndRepaint()
+end
+
 function BookFusionTab:_onLeftIcon()
-    -- v1 behaviour: delegate to BF plugin's own search-capable browser.
-    Data.openBrowser()
+    -- On the landing: open the search InputDialog.  On subpages the left
+    -- icon is a back chevron whose callback is wired in _buildTitleBar.
+    self:_showSearchDialog()
 end
 
 function BookFusionTab:_onRightIcon()
@@ -1464,6 +1756,9 @@ function BookFusionTab:_prefetchVisibleCovers()
         local slot = Cache.get("currently_reading")
         local list = (slot and slot.books) or {}
         for i = 1, #list do books[#books+1] = list[i] end
+    elseif self._view == "search" then
+        local list = self._search_results or {}
+        for i = 1, #list do books[#books+1] = list[i] end
     else
         local k = (self._view == "tbr") and "planned_to_read" or "favorites"
         local slot = Cache.get(k)
@@ -1507,6 +1802,13 @@ function BookFusionTab:onCloseWidget()
         pcall(function() UIManager:close(self._sync_popup) end)
         self._sync_popup = nil
     end
+    if self._search_popup then
+        pcall(function() UIManager:close(self._search_popup) end)
+        self._search_popup = nil
+    end
+    -- Drop any in-memory search results so the next tab open starts clean.
+    self._search_results = nil
+    self._search_query   = nil
     Covers.freeAll()
     if M._instance == self then M._instance = nil end
 end
