@@ -85,6 +85,11 @@ local SETK_GRID_ROWS        = "navbar_bookfusion_grid_rows"         -- int,   1 
 -- (grid_rows × grid_cols) so every fetch ends on a clean display-page
 -- boundary.  Hidden knob — not exposed in a settings UI.
 local SETK_SEARCH_MIN_FETCH = "navbar_bookfusion_search_min_fetch"  -- int,   8 .. 100
+-- Uniform covers: when true, every cover renders at the same tile shape by
+-- scaling-to-fill + center-cropping overflow.  When false, each cover keeps
+-- its native aspect ratio (best-fit + letterbox).  Default true — planned
+-- toggle lives under SimpleUI › Library › Uniform covers.
+local SETK_UNIFORM_COVERS   = "navbar_bookfusion_uniform_covers"    -- bool
 
 local function _clamp(v, lo, hi)
     if v < lo then return lo elseif v > hi then return hi end
@@ -104,6 +109,8 @@ function Settings.crCols()         return math.floor(_readNum(SETK_CR_COLS,     
 function Settings.gridCols()       return math.floor(_readNum(SETK_GRID_COLS,        4,  2,   6)) end
 function Settings.gridRows()       return math.floor(_readNum(SETK_GRID_ROWS,        2,  1,   6)) end
 function Settings.searchMinFetch() return math.floor(_readNum(SETK_SEARCH_MIN_FETCH, 20, 8, 100)) end
+-- Default-true: absent key / nil / truthy → uniform ON; explicit false → OFF.
+function Settings.uniformCovers()  return G_reader_settings:nilOrTrue(SETK_UNIFORM_COVERS) end
 
 -- Derived: books per API call for the current search session.
 -- Rounds `searchMinFetch()` up to the nearest multiple of the display grid,
@@ -537,16 +544,64 @@ local function _bestFitScale(bb_w, bb_h, max_w, max_h)
     end
 end
 
+-- Cover-fill scale (the max of h and w ratios): the BB is sized so the
+-- SHORTER axis matches the box exactly, guaranteeing the longer axis
+-- overflows.  Combined with ImageWidget's width/height + center_x/y_ratio
+-- cropping, this yields uniform tile shapes with the centered part of the
+-- cover visible — the standard "cover" behaviour in CSS object-fit terms.
+local function _coverFillScale(bb_w, bb_h, max_w, max_h)
+    return math.max(max_w / bb_w, max_h / bb_h)
+end
+
 -- Build the cover widget AND report its actual rendered outer size (including
 -- the 1px border on each side).  The caller (BookTile) uses this width so the
 -- progress bar ends up exactly under the visible cover — no letterbox gap.
 --
--- Returns: widget, actual_w, actual_h  (actual_w/h = scaled image + 2*border)
+-- Two modes, chosen by Settings.uniformCovers():
+--   • uniform = true  (default)  → scale-to-fill + centre-crop.  Every tile
+--     is exactly box_w × box_h; box sets / landscape covers lose their edges
+--     but the grid looks consistent.
+--   • uniform = false             → best-fit + letterbox.  Each cover keeps
+--     its native aspect, so shapes in the grid vary.
+--
+-- Returns: widget, actual_w, actual_h  (scaled-image + 2*border dims)
 local function _coverImage(bb, bb_w, bb_h, box_w, box_h)
     -- Inner box inside the border on both sides.
     local inner_w = box_w - 2 * COVER_BORDER_SIZE
     local inner_h = box_h - 2 * COVER_BORDER_SIZE
-    local scale   = _bestFitScale(bb_w, bb_h, inner_w, inner_h)
+    local uniform = Settings.uniformCovers()
+    local bw = COVER_BORDER_SIZE
+
+    if uniform then
+        -- Scale-to-fill: ImageWidget with scale_factor = cover-fill grows
+        -- the BB past inner_w × inner_h, then paints only the centred
+        -- (inner_w × inner_h) region thanks to width/height + default
+        -- center_x/y_ratio = 0.5 (imagewidget.lua:347-370, paintTo uses
+        -- _offset_x/y to blit the cropped region).
+        local scale = _coverFillScale(bb_w, bb_h, inner_w, inner_h)
+        local ok, img = pcall(function()
+            local w = ImageWidget:new{
+                image            = bb,
+                image_disposable = false,   -- owned by Covers cache
+                scale_factor     = scale,
+                width            = inner_w, -- paint-area — crops overflow
+                height           = inner_h,
+            }
+            w:_render()
+            return w
+        end)
+        if not (ok and img) then return nil, box_w, box_h end
+        local frame = FrameContainer:new{
+            bordersize = bw, color = COLOR_COVER_BORDER,
+            padding = 0, margin = 0,
+            dimen = Geom:new{ w = box_w, h = box_h },
+            img,
+        }
+        return frame, box_w, box_h
+    end
+
+    -- Best-fit / letterbox mode — preserves native aspect ratio.
+    local scale = _bestFitScale(bb_w, bb_h, inner_w, inner_h)
     local ok, img = pcall(function()
         local w = ImageWidget:new{
             image            = bb,
@@ -563,7 +618,6 @@ local function _coverImage(bb, bb_w, bb_h, box_w, box_h)
     -- Frame hugs the scaled image: no CenterContainer, no letterbox whitespace.
     -- Tile VerticalGroup(align="center") centers this frame + the progress bar
     -- within the tile column, keeping them perfectly stacked.
-    local bw = COVER_BORDER_SIZE
     local actual_w = sz.w + 2 * bw  -- border on both sides
     local actual_h = sz.h + 2 * bw
     local frame = FrameContainer:new{
