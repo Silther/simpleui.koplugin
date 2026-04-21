@@ -925,17 +925,28 @@ function BookFusionTab:_buildTitleBar()
         left_icon = "chevron.left"
         left_cb   = function() self:_exitSubpage() end
     end
-    return TitleBar:new{
+    local tb = TitleBar:new{
         show_parent              = self,
         fullscreen               = true,
         title                    = title,
-        -- Omit title_top_padding so TitleBar auto-computes it by aligning
-        -- the text baseline with the icon baseline (titlebar.lua:183-189).
-        -- With the explicit 6px override it used to have, the title+icons
-        -- sat near the top of the bar with visible empty space below;
-        -- baseline-alignment centres them vertically within the bar's
-        -- visual height.
-        button_padding           = Screen:scaleBySize(11),
+        -- Match FileManager's explicit 6 px title_top_padding
+        -- (filemanager.lua:125) so the BookFusion title bar has the same
+        -- vertical footprint as the Library tab.  Without this the
+        -- auto-compute at titlebar.lua:182-200 baseline-aligns title with
+        -- icons, yielding a shorter bar that looks different from the FM.
+        title_top_padding        = Screen:scaleBySize(6),
+        -- Empty-but-present subtitle forces TitleBar to reserve the
+        -- subtitle's vertical slot (titlebar.lua:207 treats "" as truthy),
+        -- adding the extra bottom block that gives the FM title bar its
+        -- characteristic height.  Without this, our bar is shorter than
+        -- the Library tab even with matching title_top_padding.
+        subtitle                 = "",
+        -- Match FileManager (filemanager.lua:129): 5 px button padding so
+        -- icons sit the same distance from the screen edge and the hit
+        -- rects are the same size as the Library tab's.  Earlier this was
+        -- bumped to 11 for visible breathing room, but now we're aligning
+        -- to the FM look exactly.
+        button_padding           = Screen:scaleBySize(5),
         left_icon                = left_icon,
         left_icon_size_ratio     = 1,
         left_icon_tap_callback   = left_cb,
@@ -945,6 +956,45 @@ function BookFusionTab:_buildTitleBar()
         right_icon_tap_callback  = function() self:_onRightIcon() end,
         right_icon_hold_callback = false,
     }
+    -- Strip TitleBar's asymmetric tap-zone padding on both icon buttons so
+    -- their dimens become tight squares (icon_size × icon_size), matching
+    -- what sui_titlebar._resizeAndStrip does to the FileManager's buttons.
+    -- TitleBar defaults add `padding_right = 2*icon_size` (left button),
+    -- `padding_left = 2*icon_size` (right button), and `padding_bottom =
+    -- icon_size` on both (titlebar.lua:363-381), which extends the hitbox
+    -- inward and downward — visually it makes the icon rectangles larger
+    -- and creates a visible vertical separator line between the icons and
+    -- the title.  Zeroing these + :update() mirrors the Library tab look.
+    --
+    -- Edge inset: zero ALL paddings so each button's dimen hugs the icon
+    -- tightly (no edge-side fringe inside the hitbox), then push the
+    -- button 18 px inward from the screen edge via overlap_offset —
+    -- exactly how sui_titlebar places the FM buttons
+    -- (sui_titlebar.lua:335-336 via _buttonX with pad=18).  Net effect:
+    -- the hitbox rectangle sits 18 px from the edge, not at the edge
+    -- with 18 px of inner padding.
+    local edge_pad = Screen:scaleBySize(18)
+    local sw       = Screen:getWidth()
+    for _, btn in ipairs({ tb.left_button, tb.right_button }) do
+        if btn then
+            btn.padding_left   = 0
+            btn.padding_right  = 0
+            btn.padding_bottom = 0
+            if btn.update then btn:update() end
+        end
+    end
+    if tb.left_button then
+        tb.left_button.overlap_align  = nil
+        tb.left_button.overlap_offset = { edge_pad, 0 }
+    end
+    if tb.right_button then
+        local iw = tb.right_button.width
+                or (tb.right_button.image and tb.right_button.image.width)
+                or Screen:scaleBySize(36)
+        tb.right_button.overlap_align  = nil
+        tb.right_button.overlap_offset = { sw - iw - edge_pad, 0 }
+    end
+    return tb
 end
 
 -- Available area under the title bar, above the SUI navbar.  Safe to call
