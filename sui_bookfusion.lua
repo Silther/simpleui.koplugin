@@ -75,10 +75,39 @@ M._instance = nil
 
 local Settings = {}
 
-local SETK_COVER_SCALE      = "navbar_bookfusion_cover_scale"       -- float, 0.6 .. 1.6
-local SETK_TEXT_SCALE       = "navbar_bookfusion_text_scale"        -- float, 0.6 .. 1.6
-local SETK_CR_COLS          = "navbar_bookfusion_cr_cols"           -- int,   2 .. 6
-local SETK_GRID_COLS        = "navbar_bookfusion_grid_cols"         -- int,   2 .. 6
+-- Cover scale only exists for the landing page's Currently Reading
+-- carousel.  The folder/search grid sizes its covers purely from
+-- grid_rows × grid_cols and the screen dimensions — no scale knob there.
+local SETK_COVER_SCALE_CR   = "navbar_bookfusion_cover_scale_cr"    -- float, 0.5 .. 1.6  (carousel)
+-- Text-size knobs split per surface.  Cover titles in the carousel can
+-- be sized independently of cover titles in the folder grid (two
+-- different contexts — carousel tiles are bigger, with more horizontal
+-- room; folder tiles are small and tight).  `label_scale` covers UI
+-- chrome — section headings ("Currently Reading", "Folders"), folder
+-- nav buttons, the pager "1 / 3", and empty-state copy.  The TitleBar
+-- sits outside all three; KOReader's TitleBar picks its own metrics.
+local SETK_TEXT_SCALE_CR     = "navbar_bookfusion_text_scale_cr"     -- float, 0.6 .. 1.6  (carousel)
+local SETK_TEXT_SCALE_FOLDER = "navbar_bookfusion_text_scale_folder" -- float, 0.6 .. 1.6  (folder grid)
+local SETK_LABEL_SCALE      = "navbar_bookfusion_label_scale"       -- float, 0.6 .. 1.6
+-- Per-surface visibility toggles — let users hide metadata they don't
+-- want eating tile budget.  When any of these is off, the cover grows
+-- to absorb the freed vertical space (see _buildLanding / _buildSubpage
+-- tile_h math).  All default on.
+local SETK_SHOW_CR_TITLE    = "navbar_bookfusion_show_cr_title"     -- bool  (carousel)
+local SETK_SHOW_CR_PROGRESS = "navbar_bookfusion_show_cr_progress"  -- bool  (carousel)
+-- Progress-indicator style for the carousel:
+--   "bar"     — LineWidget track + fill under the cover (default).
+--   "overlay" — round "XX %" badge half-overlapping the cover's bottom
+--               edge, modeled after `module_recent.lua`'s
+--               "Percentage overlay on cover" setting.  When "overlay"
+--               is active the bar widget is skipped so the two don't
+--               stack.
+local SETK_CR_PROGRESS_STYLE = "navbar_bookfusion_cr_progress_style" -- "bar" | "overlay"
+local SETK_SHOW_CR_PAGER    = "navbar_bookfusion_show_cr_pager"     -- bool  (carousel)
+local SETK_SHOW_FOLDER_TITLE = "navbar_bookfusion_show_folder_title" -- bool (folder grid)
+-- Carousel column count is auto-derived from SETK_COVER_SCALE_CR + screen
+-- width in _buildLanding, so there's no stand-alone cr_cols key anymore.
+local SETK_GRID_COLS        = "navbar_bookfusion_grid_cols"         -- int,   1 .. 7
 local SETK_GRID_ROWS        = "navbar_bookfusion_grid_rows"         -- int,   1 .. 6
 -- Search fetch floor: target min books per API call for in-place search.
 -- Actual fetch_size rounds up to the nearest multiple of the display grid
@@ -90,6 +119,16 @@ local SETK_SEARCH_MIN_FETCH = "navbar_bookfusion_search_min_fetch"  -- int,   8 
 -- its native aspect ratio (best-fit + letterbox).  Default true — planned
 -- toggle lives under SimpleUI › Library › Uniform covers.
 local SETK_UNIFORM_COVERS   = "navbar_bookfusion_uniform_covers"    -- bool
+-- Download indicators — PLACEHOLDER for a future feature that marks
+-- already-downloaded books on tiles (e.g. a badge, icon, or outline).
+-- Readers are wired so callers can already gate the render path, but no
+-- render path exists yet.  Two independent keys:
+--   • global : default on — controls the landing + subpage grids.
+--   • search : default on — controls the search results grid.  Split
+--     so users can suppress the badge during search (where the indicator
+--     is arguably less useful) without losing it elsewhere.
+local SETK_DL_IND_GLOBAL    = "navbar_bookfusion_dl_ind"            -- bool
+local SETK_DL_IND_SEARCH    = "navbar_bookfusion_dl_ind_search"     -- bool
 
 local function _clamp(v, lo, hi)
     if v < lo then return lo elseif v > hi then return hi end
@@ -103,14 +142,52 @@ local function _readNum(key, default, lo, hi)
     return _clamp(n, lo, hi)
 end
 
-function Settings.coverScale()     return _readNum(SETK_COVER_SCALE,     1.0, 0.6, 1.6) end
-function Settings.textScale()      return _readNum(SETK_TEXT_SCALE,      1.0, 0.6, 1.6) end
-function Settings.crCols()         return math.floor(_readNum(SETK_CR_COLS,          3,  2,   6)) end
-function Settings.gridCols()       return math.floor(_readNum(SETK_GRID_COLS,        4,  2,   6)) end
+-- Cover scale for the Currently Reading carousel only.  Values above 1.0
+-- yield bigger covers (and therefore fewer per row, since cr_cols is now
+-- derived from the scale); values below 1.0 give smaller covers and more
+-- per row.  Folder grids use the full tile width regardless — see
+-- _buildSubpage.
+function Settings.coverScaleCarousel() return _readNum(SETK_COVER_SCALE_CR, 1.0, 0.5, 1.6) end
+function Settings.textScaleCarousel()  return _readNum(SETK_TEXT_SCALE_CR,     1.0, 0.6, 1.6) end
+function Settings.textScaleFolder()    return _readNum(SETK_TEXT_SCALE_FOLDER, 1.0, 0.6, 1.6) end
+function Settings.labelScale()         return _readNum(SETK_LABEL_SCALE,   1.0, 0.6, 1.6) end
+-- Default-true visibility toggles.
+function Settings.showCarouselTitle()    return G_reader_settings:nilOrTrue(SETK_SHOW_CR_TITLE) end
+function Settings.showCarouselProgress() return G_reader_settings:nilOrTrue(SETK_SHOW_CR_PROGRESS) end
+-- "bar" | "overlay"; unknown / unset values fall back to "bar".
+function Settings.progressStyleCarousel()
+    local v = G_reader_settings:readSetting(SETK_CR_PROGRESS_STYLE)
+    return v == "overlay" and "overlay" or "bar"
+end
+function Settings.showCarouselPager()    return G_reader_settings:nilOrTrue(SETK_SHOW_CR_PAGER) end
+function Settings.showFolderTitle()      return G_reader_settings:nilOrTrue(SETK_SHOW_FOLDER_TITLE) end
+function Settings.gridCols()       return math.floor(_readNum(SETK_GRID_COLS,        4,  1,   7)) end
 function Settings.gridRows()       return math.floor(_readNum(SETK_GRID_ROWS,        2,  1,   6)) end
 function Settings.searchMinFetch() return math.floor(_readNum(SETK_SEARCH_MIN_FETCH, 20, 8, 100)) end
 -- Default-true: absent key / nil / truthy → uniform ON; explicit false → OFF.
-function Settings.uniformCovers()  return G_reader_settings:nilOrTrue(SETK_UNIFORM_COVERS) end
+function Settings.uniformCovers()         return G_reader_settings:nilOrTrue(SETK_UNIFORM_COVERS) end
+-- Placeholder readers — render path will gate on these when the feature lands.
+function Settings.showDownloadIndicators()       return G_reader_settings:nilOrTrue(SETK_DL_IND_GLOBAL) end
+function Settings.showDownloadIndicatorsSearch() return G_reader_settings:nilOrTrue(SETK_DL_IND_SEARCH) end
+
+-- Key exports so the settings-menu module can read/write via saveSetting
+-- without duplicating the "navbar_bookfusion_…" string constants.
+Settings.KEYS = {
+    COVER_SCALE_CR      = SETK_COVER_SCALE_CR,
+    TEXT_SCALE_CR       = SETK_TEXT_SCALE_CR,
+    TEXT_SCALE_FOLDER   = SETK_TEXT_SCALE_FOLDER,
+    LABEL_SCALE         = SETK_LABEL_SCALE,
+    GRID_COLS           = SETK_GRID_COLS,
+    GRID_ROWS           = SETK_GRID_ROWS,
+    UNIFORM_COVERS      = SETK_UNIFORM_COVERS,
+    SHOW_CR_TITLE       = SETK_SHOW_CR_TITLE,
+    SHOW_CR_PROGRESS    = SETK_SHOW_CR_PROGRESS,
+    CR_PROGRESS_STYLE   = SETK_CR_PROGRESS_STYLE,
+    SHOW_CR_PAGER       = SETK_SHOW_CR_PAGER,
+    SHOW_FOLDER_TITLE   = SETK_SHOW_FOLDER_TITLE,
+    DL_IND_GLOBAL       = SETK_DL_IND_GLOBAL,
+    DL_IND_SEARCH       = SETK_DL_IND_SEARCH,
+}
 
 -- Derived: books per API call for the current search session.
 -- Rounds `searchMinFetch()` up to the nearest multiple of the display grid,
@@ -712,15 +789,87 @@ local function _progressBar(pct, w)
     }
 end
 
+-- Round "XX %" badge overlaid on the cover's bottom edge — modelled
+-- after module_recent.lua's "Percentage overlay on cover"
+-- (module_recent.lua:113-144).  Half of the badge sits inside the cover,
+-- the other half bleeds below — so the caller must build an OverlapGroup
+-- sized (cov_w × (cov_h + badge_r)) that contains both the cover widget
+-- and this badge to avoid clipping the lower half.
+--
+-- Sizing: the badge is sized to CONTAIN the rendered "100%" text plus
+-- a few pixels of padding.  We probe TextWidget:getSize() using the
+-- actual face we're about to render with, so the badge scales exactly
+-- with the text — not with cover width (the original home-screen
+-- formula `cw × 0.28` produces correctly-sized badges only for their
+-- small ~100 px thumbnails; on BookFusion's 200+ px carousel covers
+-- it explodes) and not with a made-up fixed multiplier (produces a
+-- badge smaller than the text it needs to contain).
+
+-- Computes the badge's diameter + radius from text_scale.  Extracted so
+-- _buildLanding's reserve calc can mirror it exactly without building
+-- the full widget.  "100%" is the template: all percentages are ≤ 3
+-- digits + "%", so sizing to 100% keeps the badge uniform across all
+-- values.
+local function _overlayBadgeDims(text_scale)
+    local scale  = text_scale or 1.0
+    local pct_fs = math.max(8, math.floor(Screen:scaleBySize(8) * scale))
+    local probe  = TextWidget:new{
+        text = "100%",
+        face = Font:getFace("smallinfofont", pct_fs),
+        bold = true,
+    }
+    local probe_size = probe:getSize()
+    -- Tight padding — just enough breath so the text doesn't touch the
+    -- circle edge.  Going below ~2 px risks the "100%" corner glyphs
+    -- clipping at the rounded badge edge; 3 px sits safely above that.
+    local pad        = Screen:scaleBySize(3)
+    local badge_d    = math.max(
+        Screen:scaleBySize(14),
+        probe_size.w + 2 * pad,
+        probe_size.h + 2 * pad
+    )
+    local badge_r = math.floor(badge_d / 2)
+    return badge_r * 2, badge_r, pct_fs   -- rounded-even diameter, radius, font size
+end
+
+-- Returns: badge_widget, badge_r, badge_d — caller uses the latter two
+-- to size its OverlapGroup and to reserve vertical budget in the tile.
+local function _overlayBadge(pct, text_scale)
+    local pct_int = math.floor((tonumber(pct) or 0) * 100)
+    local badge_d, badge_r, pct_fs = _overlayBadgeDims(text_scale)
+    local badge = FrameContainer:new{
+        bordersize = 0,
+        background = Blitbuffer.gray(0.15),
+        padding    = 0,
+        dimen      = Geom:new{ w = badge_d, h = badge_d },
+        radius     = badge_r,
+        CenterContainer:new{
+            dimen = Geom:new{ w = badge_d, h = badge_d },
+            TextWidget:new{
+                text    = string.format(_("%d%%"), pct_int),
+                face    = Font:getFace("smallinfofont", pct_fs),
+                bold    = true,
+                fgcolor = Blitbuffer.COLOR_BLACK,
+            },
+        },
+    }
+    return badge, badge_r, badge_d
+end
+
 local BookTile = InputContainer:extend{}
 
--- opts = { book, w, h, cover_h, show_progress, on_tap, text_scale }
+-- opts = { book, w, h, cover_w, cover_h, show_progress, progress_style,
+--          show_title, title_lines, text_scale, on_tap }
 function BookTile:init()
     local o = self.opts
     local book = o.book or {}
     local w    = o.w
     local h    = o.h
-    local cov_w = w
+    -- cover_w is optional: callers that want cover-scale to shrink the
+    -- cover horizontally (as well as vertically) pass it explicitly.  When
+    -- omitted we fall back to the full tile width, preserving the old
+    -- width-always-fills behaviour for any caller that hasn't migrated.
+    local cov_w = o.cover_w or w
     local cov_h = o.cover_h
 
     -- Cover (real or placeholder).  _coverImage returns the widget PLUS its
@@ -728,14 +877,38 @@ function BookTile:init()
     -- border on each side).  We use that actual width for the progress bar
     -- so it sits flush under the visible cover.  Placeholder covers fill the
     -- whole box, so actual_w falls back to cov_w in that branch.
-    local cover, actual_w
+    local cover, actual_w, actual_h
     if book.cover_url and book.cover_url ~= "" then
         local bb, bb_w, bb_h = Covers.getBB(book.cover_url, book.cover_w, book.cover_h)
-        if bb then cover, actual_w = _coverImage(bb, bb_w, bb_h, cov_w, cov_h) end
+        if bb then cover, actual_w, actual_h = _coverImage(bb, bb_w, bb_h, cov_w, cov_h) end
     end
     if not cover then
         cover    = _coverPlaceholder(book.title, cov_w, cov_h)
         actual_w = cov_w
+        actual_h = cov_h
+    end
+
+    -- Overlay-badge mode: wrap the cover widget in an OverlapGroup that
+    -- includes the bottom half of the badge bleeding below the cover,
+    -- positioned horizontally centred with half inside / half outside
+    -- (same geometry as module_recent.lua:113-144).  When active the
+    -- separate progress bar below is skipped — the two indicators would
+    -- be redundant.
+    local use_overlay = o.show_progress and o.progress_style == "overlay"
+    if use_overlay then
+        local pct = tonumber(book.percentage) or 0
+        local badge, badge_r, badge_d = _overlayBadge(pct, o.text_scale)
+        -- Offset: centred horizontally over the cover, half inside /
+        -- half below the cover's bottom edge (y = actual_h - badge_r).
+        badge.overlap_offset = {
+            math.floor((actual_w - badge_d) / 2),
+            actual_h - badge_r,
+        }
+        cover = OverlapGroup:new{
+            dimen = Geom:new{ w = actual_w, h = actual_h + badge_r },
+            cover,
+            badge,
+        }
     end
 
     -- Font sizes.  Title = 6px base (slightly smaller so longer titles can
@@ -754,8 +927,19 @@ function BookTile:init()
     -- The bar is visually an extension of the cover so it should butt up
     -- against the cover's bottom edge with no gap in between.
     local vg = VerticalGroup:new{ align = "center" }
+    -- Zero-height, tile-wide sentinel so the VG's intrinsic width equals
+    -- the tile width regardless of which children end up in it.  Without
+    -- this, hiding the title makes the VG only as wide as the cover, and
+    -- FrameContainer then renders that narrower VG at (0,0) of the tile
+    -- — covers drift to the left instead of staying centered.  The
+    -- HorizontalSpan has height=0, so it costs no vertical budget.
+    vg[#vg+1] = HorizontalSpan:new{ width = w }
     vg[#vg+1] = cover
-    if o.show_progress then
+    -- Bar-style progress indicator: only drawn when progress is on AND the
+    -- style isn't the overlay badge (the badge lives on the cover itself
+    -- and is rendered above, so stacking a bar below it would be
+    -- redundant and eat vertical budget).
+    if o.show_progress and not use_overlay then
         local pct = tonumber(book.percentage) or 0
         -- Cover→bar gap: 4px at base scale (tighter than the home screen's
         -- 6px because there's no author-descender above the bar here).
@@ -765,12 +949,18 @@ function BookTile:init()
         -- cover's aspect ratio differs from the tile box's aspect.
         vg[#vg+1] = _progressBar(pct, actual_w)
     end
-    vg[#vg+1] = VerticalSpan:new{ width = Screen:scaleBySize(4) }
-    -- Title uses the full tile width so long titles can wrap/ellipse nicely
-    -- across the tile rather than being cramped under a narrower cover.
-    -- opts.title_lines lets callers pick 1 (subpage grids) or 2 (carousel);
-    -- default is 2 so existing callers that don't set it keep the old behaviour.
-    vg[#vg+1] = _titleLabel(book.title, w, title_fs, o.title_lines or 2)
+    -- Title strip is opt-in per surface.  Default true so callers that
+    -- haven't migrated to the show_title opt keep the old behaviour.  When
+    -- titles are hidden the cover can absorb the freed tile height (the
+    -- caller is responsible for not reserving title_h in tile_h).
+    if o.show_title ~= false then
+        vg[#vg+1] = VerticalSpan:new{ width = Screen:scaleBySize(4) }
+        -- Title uses the full tile width so long titles can wrap/ellipse nicely
+        -- across the tile rather than being cramped under a narrower cover.
+        -- opts.title_lines lets callers pick 1 (subpage grids) or 2 (carousel);
+        -- default is 2 so existing callers that don't set it keep the old behaviour.
+        vg[#vg+1] = _titleLabel(book.title, w, title_fs, o.title_lines or 2)
+    end
 
     self.dimen = Geom:new{ w = w, h = h }
     self[1] = FrameContainer:new{
@@ -1077,14 +1267,28 @@ end
 -- ---------------------------------------------------------------------------
 function BookFusionTab:_buildLanding(sw, content_h)
     local inner_w  = sw - 2 * UI.SIDE_PAD
-    local txt_sc   = Settings.textScale()
-    local cov_sc   = Settings.coverScale()
-    local cr_cols  = Settings.crCols()
+    -- text_scale → cover title under each BookTile (content text).
+    -- label_scale → section headings, nav buttons, empty-state copy
+    -- (chrome text).  Kept separate because the user reasonably wants
+    -- fine-grained control — e.g. big folder buttons with compact titles.
+    local txt_sc      = Settings.textScaleCarousel()
+    local lbl_sc      = Settings.labelScale()
+    -- Per-surface visibility — each one lets the cover grow to absorb the
+    -- freed vertical space (see tile_h computation below).
+    local show_title  = Settings.showCarouselTitle()
+    local show_progr  = Settings.showCarouselProgress()
+    local show_pager  = Settings.showCarouselPager()
+    local progr_style = Settings.progressStyleCarousel()
+    local use_overlay = show_progr and progr_style == "overlay"
+    -- Carousel uses its own cover-scale knob; cr_cols is derived from it
+    -- further down (after we know carousel_inner_w and tile_gap).  Smaller
+    -- scale → more covers per row; larger scale → fewer.
+    local cov_sc   = Settings.coverScaleCarousel()
 
     -- Section label — bold + small + mid-gray.  Small enough not to compete
     -- with the covers, bold enough to read as a hierarchy signpost.
-    local section_fs = math.max(6, math.floor(Screen:scaleBySize(7) * txt_sc))
-    local button_fs  = math.max(7, math.floor(Screen:scaleBySize(8) * txt_sc))
+    local section_fs = math.max(6, math.floor(Screen:scaleBySize(7) * lbl_sc))
+    local button_fs  = math.max(7, math.floor(Screen:scaleBySize(8) * lbl_sc))
 
     -- Fixed-height elements on the landing (top-down).  Used to compute
     -- carousel cover height so the page never needs scrolling.
@@ -1094,12 +1298,15 @@ function BookFusionTab:_buildLanding(sw, content_h)
     -- tile_text_h must accommodate the actual 2-line rendered height of the
     -- title TextBoxWidget, which depends on face.size (double-scaled on hi-DPI
     -- devices via Font:getFace).  Compute it from the same face the tile will
-    -- use so the budget stays accurate on every device.
-    local _tile_title_fs   = math.max(6, math.floor(Screen:scaleBySize(6) * txt_sc))
-    local _tile_title_face = Font:getFace("cfont", _tile_title_fs)
-    local _tile_title_lh   = math.floor((1 + 0.3) * _tile_title_face.size + 0.5)
-    local tile_text_h     = _tile_title_lh * 2 + Screen:scaleBySize(3)  -- 2 lines + rounding margin
-    local tile_pct_h      = Screen:scaleBySize(11)  -- 7px bar + gap
+    -- use so the budget stays accurate on every device.  When the title is
+    -- hidden we reserve zero, freeing that height for the cover.
+    local tile_text_h = 0
+    if show_title then
+        local _tile_title_fs   = math.max(6, math.floor(Screen:scaleBySize(6) * txt_sc))
+        local _tile_title_face = Font:getFace("cfont", _tile_title_fs)
+        local _tile_title_lh   = math.floor((1 + 0.3) * _tile_title_face.size + 0.5)
+        tile_text_h            = _tile_title_lh * 2 + Screen:scaleBySize(3)  -- 2 lines + rounding margin
+    end
     local top_pad         = UI.PAD
     local between_sections = UI.MOD_GAP   -- gap between CR row and Folders heading
     local bot_pad         = UI.PAD
@@ -1112,24 +1319,104 @@ function BookFusionTab:_buildLanding(sw, content_h)
     local arrow_gap = UI.SIDE_PAD
     local carousel_inner_w = inner_w - 2 * (arrow_w + arrow_gap)
 
-    -- Tile width from cols.
-    local tile_gap = UI.PAD2
-    local tile_w   = math.floor((carousel_inner_w - (cr_cols - 1) * tile_gap) / cr_cols)
+    -- Tile width from cols.  cr_cols is derived from the carousel cover
+    -- scale: we pick a "natural" tile width (carousel divided into 3
+    -- columns — matches the old default of cr_cols=3 at scale=100%), then
+    -- scale it by cov_sc to get the user's desired tile width, and fit as
+    -- many of those as the available carousel width allows (minimum 1).
+    --
+    -- Computed early (before tile_pct_h / cover_budget) because the
+    -- overlay-badge reserve depends on tile_w.
+    local tile_gap        = UI.PAD2
+    local min_tile_gap    = tile_gap  -- honour the minimum we picked above
+    local natural_tile_w  = math.floor((carousel_inner_w - 2 * min_tile_gap) / 3)
+    local target_tile_w   = math.max(1, math.floor(natural_tile_w * cov_sc))
+    local cr_cols         = math.max(1,
+                              math.floor((carousel_inner_w + min_tile_gap) / (target_tile_w + min_tile_gap)))
+    local tile_w          = target_tile_w
+    -- Distribute leftover width as the inter-cover gap.  With the cr_cols
+    -- formula above, the leftover is always ≥ (cr_cols - 1) * min_tile_gap,
+    -- so `tile_gap` is guaranteed ≥ min_tile_gap.  When cr_cols == 1 the
+    -- LeftContainer/CenterContainer below handles positioning; tile_gap is
+    -- unused.
+    if cr_cols > 1 then
+        local slack = carousel_inner_w - cr_cols * tile_w
+        tile_gap    = math.max(min_tile_gap, math.floor(slack / (cr_cols - 1)))
+    end
+
+    -- Progress-indicator reserve:
+    --   hidden  → 0 (cover takes the space).
+    --   bar     → 7 px bar + 4 px cover→bar gap ≈ 11 px at base scale.
+    --   overlay → bottom half of the badge bleeds below the cover
+    --             (badge_r from the shared _overlayBadgeDims helper,
+    --             so we stay byte-identical with what BookTile ends up
+    --             rendering) plus 4 px breath so the title doesn't sit
+    --             on the badge's arc.
+    local tile_pct_h = 0
+    if show_progr then
+        if progr_style == "overlay" then
+            local _, badge_r = _overlayBadgeDims(txt_sc)
+            tile_pct_h = badge_r + Screen:scaleBySize(4)
+        else
+            tile_pct_h = Screen:scaleBySize(11)
+        end
+    end
+    -- Carousel pager label ("1 / 2", mid-grey): small gap above to
+    -- separate it from the book titles, very small gap below so it sits
+    -- close to the Folders heading (the pager itself acts as the section
+    -- separator — between_sections is skipped in the render path below).
+    local cr_pager_fs        = math.max(6, math.floor(Screen:scaleBySize(7) * lbl_sc))
+    local cr_pager_gap_above = Screen:scaleBySize(6)
+    local cr_pager_gap_below = Screen:scaleBySize(2)
+    local cr_pager_line_h    = 0
+    local cr_pager_h         = 0
+    if show_pager then
+        -- Line-height formula matches TextBoxWidget's internal one so the
+        -- reserve tracks what the widget actually paints.
+        local _cr_pager_face = Font:getFace("cfont", cr_pager_fs)
+        cr_pager_line_h = math.floor((1 + 0.3) * _cr_pager_face.size + 0.5)
+        cr_pager_h      = cr_pager_gap_above + cr_pager_line_h + cr_pager_gap_below
+    end
 
     -- Carousel sizing — *natural*, not stretched.  We want Folders to sit
     -- right under its heading; any extra vertical space flows to the bottom
     -- pad instead of inflating the covers.  Cap cover height at a 1.55
     -- aspect ratio (typical book cover) AND at whatever the height budget
     -- can spare, whichever is smaller.
+    -- CR→Folders separator: when the pager is shown, it IS the separator
+    -- (cr_pager_h already includes its own above/below gaps).  When
+    -- hidden, we use a small fixed gap rather than the full
+    -- between_sections — otherwise turning the pager off visually looks
+    -- identical to leaving it on (the empty space just replaces the
+    -- text), defeating the point of the toggle.  Single variable so
+    -- reserved accurately matches what we render below.
+    -- 15 px sits between the pre-pager layout's 23 px gap and the tight
+    -- 8 px we had for "collapsed" mode — a compromise so turning the
+    -- pager off still reads as a smaller layout without making the
+    -- Folders heading hug the carousel tiles.
+    local cr_pager_off_gap  = Screen:scaleBySize(15)
+    local cr_to_folders_gap = show_pager and cr_pager_h or cr_pager_off_gap
     local reserved = top_pad
                    + section_lbl_h + pre_section_gap + Screen:scaleBySize(6) -- CR heading (extra breathing room before covers)
                    + tile_text_h + tile_pct_h + Screen:scaleBySize(8) -- tile extras
-                   + between_sections
+                   + cr_to_folders_gap                                -- pager OR between_sections
                    + section_lbl_h + pre_section_gap                  -- Folders heading
                    + 3 * button_h + 2 * math.floor(UI.PAD / 2)        -- 3 nav buttons + 2 half-PAD gaps
                    + bot_pad
     local cover_budget = content_h - reserved
-    local cover_h = math.min(math.floor(tile_w * 1.55 * cov_sc), cover_budget)
+    -- Preserve book aspect (1.55) even when the vertical budget is tight:
+    -- if cover_w × 1.55 exceeds the budget, shrink cover_w to keep the
+    -- display box proportional.  Without this, uniform-cover mode would
+    -- scale-to-fill and crop the top/bottom of every cover on
+    -- short-height screens.
+    local cover_w, cover_h
+    if cover_budget < math.floor(tile_w * 1.55) then
+        cover_h = cover_budget
+        cover_w = math.floor(cover_h / 1.55)
+    else
+        cover_w = tile_w
+        cover_h = math.floor(cover_w * 1.55)
+    end
     if cover_h < Screen:scaleBySize(60) then cover_h = Screen:scaleBySize(60) end
     local tile_h = cover_h + tile_text_h + tile_pct_h + Screen:scaleBySize(8)
 
@@ -1154,13 +1441,16 @@ function BookFusionTab:_buildLanding(sw, content_h)
         end
         tiles[#tiles+1] = BookTile:new{
             opts = {
-                book          = cr_books[i],
-                w             = tile_w,
-                h             = tile_h,
-                cover_h       = cover_h,
-                show_progress = true,
-                text_scale    = txt_sc,
-                on_tap        = function(b) Data.selectBook(b) end,
+                book           = cr_books[i],
+                w              = tile_w,
+                h              = tile_h,
+                cover_w        = cover_w,   -- explicit so cov_sc scales width too
+                cover_h        = cover_h,
+                show_progress  = show_progr,
+                progress_style = progr_style,
+                show_title     = show_title,
+                text_scale     = txt_sc,
+                on_tap         = function(b) Data.selectBook(b) end,
             },
         }
     end
@@ -1301,7 +1591,7 @@ function BookFusionTab:_buildLanding(sw, content_h)
             TextBoxWidget:new{
                 text = empty_text,
                 face = Font:getFace("cfont",
-                    math.max(10, math.floor(Screen:scaleBySize(11) * txt_sc))),
+                    math.max(10, math.floor(Screen:scaleBySize(11) * lbl_sc))),
                 width = inner_w,
             },
         }
@@ -1311,7 +1601,28 @@ function BookFusionTab:_buildLanding(sw, content_h)
             carousel_row,
         }
     end
-    vg[#vg+1] = VerticalSpan:new{ width = between_sections }
+    -- Carousel pager: same style as the folder pager — subdued mid-grey
+    -- "X / Y" centred horizontally, sized by lbl_sc.  When shown, it
+    -- acts as the section separator between Currently Reading and
+    -- Folders; between_sections is skipped.  Tight layout:
+    --   cr_pager_gap_above  — small breath above pager
+    --   cr_pager_line_h     — the text itself
+    --   cr_pager_gap_below  — very small breath below pager
+    -- Total (cr_pager_h) was already reserved in `cr_to_folders_gap`.
+    if show_pager then
+        vg[#vg+1] = VerticalSpan:new{ width = cr_pager_gap_above }
+        vg[#vg+1] = CenterContainer:new{
+            dimen = Geom:new{ w = inner_w, h = cr_pager_line_h },
+            TextWidget:new{
+                text    = string.format("%d / %d", self._cr_page, total_pages),
+                face    = Font:getFace("cfont", cr_pager_fs),
+                fgcolor = Blitbuffer.gray(0.45),
+            },
+        }
+        vg[#vg+1] = VerticalSpan:new{ width = cr_pager_gap_below }
+    else
+        vg[#vg+1] = VerticalSpan:new{ width = cr_pager_off_gap }
+    end
     vg[#vg+1] = _sectionLabel(_("Folders"))
     vg[#vg+1] = VerticalSpan:new{ width = pre_section_gap }
     -- Half-PAD gap between folder buttons — just enough visual breathing
@@ -1343,8 +1654,14 @@ end
 -- ---------------------------------------------------------------------------
 function BookFusionTab:_buildSubpage(sw, content_h)
     local inner_w   = sw - 2 * UI.SIDE_PAD
-    local txt_sc    = Settings.textScale()
-    local cov_sc    = Settings.coverScale()
+    -- text_scale → cover titles; label_scale → pager "1 / 3" + empty-state
+    -- copy ("No books…", "Searching…").  See _buildLanding for the split.
+    local txt_sc    = Settings.textScaleFolder()
+    local lbl_sc    = Settings.labelScale()
+    local show_title = Settings.showFolderTitle()
+    -- No cover-scale knob on this surface: grid_rows × grid_cols + screen
+    -- dimensions fully determine tile size.  The user can already make
+    -- covers bigger/smaller by changing grid_rows or grid_cols.
     -- Grid geometry is now fully driven by settings: fixed `rows × cols`
     -- per page, cover dimensions derived so the whole grid exactly fills
     -- the available area.  Defaults are 2 rows × 4 cols = 8 covers per
@@ -1380,10 +1697,15 @@ function BookFusionTab:_buildSubpage(sw, content_h)
 
     -- Vertical paddings used both to size the grid area and to position
     -- the pager later on (see VG assembly below).  Declared once here so
-    -- there's a single source of truth.
-    local top_pad = Screen:scaleBySize(12)
-    local bot_pad = Screen:scaleBySize(12)
-    local grid_h  = content_h - top_pad - pager_h - bot_pad
+    -- there's a single source of truth.  `pager_top_pad` is the minimum
+    -- breathing room between the last row of covers and the pager label —
+    -- visible mostly when titles are hidden and the grid grows to absorb
+    -- the freed space.  We reserve it in grid_h so the grid can't
+    -- encroach on it.
+    local top_pad       = Screen:scaleBySize(12)
+    local bot_pad       = Screen:scaleBySize(12)
+    local pager_top_pad = Screen:scaleBySize(8)
+    local grid_h  = content_h - top_pad - pager_top_pad - pager_h - bot_pad
 
     -- Unified horizontal padding: the gap between covers matches the gap
     -- between the outermost covers and the screen edge (the FrameContainer
@@ -1391,25 +1713,40 @@ function BookFusionTab:_buildSubpage(sw, content_h)
     local tile_gap = UI.SIDE_PAD
     local row_gap  = UI.PAD
 
-    -- Subpage tiles show a 1-line title.  Reserve just one actual line of
-    -- the rendered face height (same formula as _titleLabel uses) plus a
-    -- few px of rounding margin.
-    local _sub_title_fs   = math.max(6, math.floor(Screen:scaleBySize(6) * txt_sc))
-    local _sub_title_face = Font:getFace("cfont", _sub_title_fs)
-    local _sub_title_lh   = math.floor((1 + 0.3) * _sub_title_face.size + 0.5)
-    local title_h_reserve = _sub_title_lh + Screen:scaleBySize(3)
-    local cover_title_gap = Screen:scaleBySize(4)
+    -- Subpage tiles show a 1-line title when enabled.  Reserve just one
+    -- actual line of the rendered face height (same formula as
+    -- _titleLabel uses) plus a few px of rounding margin.  When titles
+    -- are hidden, reserve zero and drop the cover→title gap — the freed
+    -- height flows into the cover.
+    local title_h_reserve, cover_title_gap = 0, 0
+    if show_title then
+        local _sub_title_fs   = math.max(6, math.floor(Screen:scaleBySize(6) * txt_sc))
+        local _sub_title_face = Font:getFace("cfont", _sub_title_fs)
+        local _sub_title_lh   = math.floor((1 + 0.3) * _sub_title_face.size + 0.5)
+        title_h_reserve       = _sub_title_lh + Screen:scaleBySize(3)
+        cover_title_gap       = Screen:scaleBySize(4)
+    end
 
-    -- Tile dimensions derived from the configured rows × cols.
-    local tile_w = math.floor((inner_w - (grid_cols - 1) * tile_gap) / grid_cols)
-    -- Vertical budget per tile: total grid_h minus inter-row gaps, divided
-    -- evenly across `rows`.  Cover_h gets whatever is left after the title
-    -- strip.  If the budget isn't enough for a sensible cover, we fall
-    -- back to a 1.5:1 aspect ratio on tile_w (scaled by cover_scale).
+    -- Tile dimensions derived purely from the configured rows × cols +
+    -- screen geometry — no user scale knob on this surface.  Fit the
+    -- cover inside tile_w × cover_h_budget while preserving the 1.5
+    -- book aspect: if the vertical budget can't hold the full-width
+    -- cover, shrink the cover WIDTH too instead of squashing the height.
+    -- Otherwise uniform-cover mode's scale-to-fill crops the top/bottom
+    -- of every cover in tight grids (many rows).
+    local tile_w         = math.floor((inner_w - (grid_cols - 1) * tile_gap) / grid_cols)
     local tile_budget_h  = math.floor((grid_h - (rows - 1) * row_gap) / rows)
-    local cover_h        = tile_budget_h - title_h_reserve - cover_title_gap
-    local aspect_cover_h = math.floor(tile_w * 1.5 * cov_sc)
-    if cover_h > aspect_cover_h then cover_h = aspect_cover_h end
+    local cover_h_budget = tile_budget_h - title_h_reserve - cover_title_gap
+    local cover_w, cover_h
+    if cover_h_budget < math.floor(tile_w * 1.5) then
+        -- Height-limited: shrink width to match 1.5 aspect.
+        cover_h = cover_h_budget
+        cover_w = math.floor(cover_h / 1.5)
+    else
+        -- Width-limited: fill tile horizontally, height follows aspect.
+        cover_w = tile_w
+        cover_h = math.floor(cover_w * 1.5)
+    end
     if cover_h < Screen:scaleBySize(60) then cover_h = Screen:scaleBySize(60) end
     local tile_h  = cover_h + cover_title_gap + title_h_reserve
     local per_page = rows * grid_cols
@@ -1439,11 +1776,13 @@ function BookFusionTab:_buildSubpage(sw, content_h)
                     book       = books[j],
                     w          = tile_w,
                     h          = tile_h,
+                    cover_w    = cover_w,
                     cover_h    = cover_h,
-                    show_progress = false,  -- subpages omit progress per spec
-                    title_lines   = 1,       -- single-line titles on subpages
-                    text_scale = txt_sc,
-                    on_tap     = function(b) Data.selectBook(b) end,
+                    show_progress = false,      -- subpages omit progress per spec
+                    show_title    = show_title, -- folder-title visibility toggle
+                    title_lines   = 1,          -- single-line titles on subpages
+                    text_scale    = txt_sc,
+                    on_tap        = function(b) Data.selectBook(b) end,
                 },
             }
         end
@@ -1482,7 +1821,7 @@ function BookFusionTab:_buildSubpage(sw, content_h)
         grid[#grid+1] = TextBoxWidget:new{
             text  = empty_text,
             face  = Font:getFace("cfont",
-                math.max(10, math.floor(Screen:scaleBySize(11) * txt_sc))),
+                math.max(10, math.floor(Screen:scaleBySize(11) * lbl_sc))),
             width = inner_w,
         }
     end
@@ -1515,7 +1854,7 @@ function BookFusionTab:_buildSubpage(sw, content_h)
             inner,
         }
     end
-    local pager_fs = math.max(6, math.floor(Screen:scaleBySize(7) * txt_sc))
+    local pager_fs = math.max(6, math.floor(Screen:scaleBySize(7) * lbl_sc))
     local pager_label = TextWidget:new{
         text    = string.format("%d / %d", self._grid_page, total_pages),
         face    = Font:getFace("cfont", pager_fs),
@@ -1545,7 +1884,10 @@ function BookFusionTab:_buildSubpage(sw, content_h)
     -- bot_pad were defined at the top of this function.
     local grid_h_actual = placed * tile_h + math.max(0, placed - 1) * row_gap
     local used_h = top_pad + grid_h_actual + pager_h + bot_pad
-    local flex_pad = math.max(Screen:scaleBySize(4), content_h - used_h)
+    -- Minimum gap between the last row of covers and the pager = the
+    -- pager_top_pad budget we reserved above.  When there's genuine slack
+    -- (e.g. a short last page) flex_pad grows to push the pager down.
+    local flex_pad = math.max(pager_top_pad, content_h - used_h)
 
     local vg = VerticalGroup:new{ align = "left" }
     vg[#vg+1] = VerticalSpan:new{ width = top_pad }
@@ -2001,5 +2343,10 @@ function M.show(_on_qa_tap)
     M._instance = w
     UIManager:show(w)
 end
+
+-- Expose so the settings-menu module can read accessors + key constants
+-- without duplicating them.  Intentionally not exposing the internal
+-- BookFusionTab class — settings UI doesn't need it.
+M.Settings = Settings
 
 return M
