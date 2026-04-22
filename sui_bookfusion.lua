@@ -55,6 +55,7 @@ local TitleBar        = require("ui/widget/titlebar")
 local UIManager       = require("ui/uimanager")
 local VerticalGroup   = require("ui/widget/verticalgroup")
 local VerticalSpan    = require("ui/widget/verticalspan")
+local Size            = require("ui/size")
 local logger          = require("logger")
 local _               = require("gettext")
 
@@ -327,6 +328,24 @@ end
 
 function Data.api() local p = Data.getPlugin(); return p and p.api or nil end
 
+-- Mirror the official plugin's "is this book already on disk?" test
+-- (bf_browser.lua:283).  Builds the filepath via Downloader.getDownloadDir
+-- + Downloader.buildFilename, then probes with lfs.  Uses the BF plugin's
+-- own settings object (preserves the user's custom download dir) with a
+-- G_reader_settings fallback when bf_settings isn't available.
+function Data.isDownloaded(book)
+    if not book or not book.id then return false end
+    local ok_dl, Downloader = pcall(require, "bf_downloader")
+    if not ok_dl or not Downloader then return false end
+    local p = Data.getPlugin()
+    local settings = p and p.bf_settings or nil
+    local dir = Downloader.getDownloadDir(settings)
+    if not dir then return false end
+    local filename = Downloader.buildFilename(book)
+    if not filename or filename == "" then return false end
+    return Downloader.fileExists(dir .. "/" .. filename) or false
+end
+
 function Data.startLink()
     local p = Data.getPlugin()
     if not p or type(p.onLinkDevice) ~= "function" then return false end
@@ -377,8 +396,19 @@ function Data.openBrowser()
 end
 
 -- Instantiate a throwaway Browser with the live api+settings so its
--- onSelectBook() (download-or-open) flow runs without owning a visible Menu.
-function Data.selectBook(book)
+-- onSelectBook() (download-or-open) flow runs without owning a visible
+-- Menu.  When `on_change` is given, it fires after a filesystem-mutating
+-- operation (successful download OR confirmed "Remove from device") so
+-- the caller can repaint — e.g. to flip the download indicator's state.
+--
+-- How the hook works: bf_browser.lua calls `self:refreshBookList()` in
+-- both paths (downloader callback at line 413, remove ok_callback at
+-- line 447), gated on `self._view == "books"`.  We set that flag on
+-- our throwaway Browser and monkey-patch refreshBookList to call our
+-- on_change instead.  This preserves the plugin's own guard logic
+-- (Read/Cancel/etc. don't trigger it) without us reimplementing the
+-- download + remove dialog flow.
+function Data.selectBook(book, on_change)
     local p = Data.getPlugin()
     if not p or not book then return false end
     local ok_req, Browser = pcall(require, "bf_browser")
@@ -388,6 +418,10 @@ function Data.selectBook(book)
     end
     local ok, err = pcall(function()
         local browser = Browser:new(p.api, p.bf_settings)
+        browser._view = "books"  -- unlocks the plugin's own refresh calls
+        browser.refreshBookList = function()
+            if on_change then pcall(on_change) end
+        end
         browser:onSelectBook(book)
     end)
     if not ok then logger.warn("simpleui-bf: selectBook failed:", tostring(err)) end
@@ -883,10 +917,51 @@ local function _overlayBadge(pct, text_scale)
     return badge, badge_r, badge_d
 end
 
+-- "Not downloaded" indicator — small rounded white rectangle with a
+-- dark-grey border and a black download-arrow glyph, matching the
+-- SimpleUI Library tab's pages/series badge style (sui_foldercovers.lua:
+-- 1771-1804).  Inverse of the official plugin's "Downloaded" label: we
+-- mark cloud-only books, not already-downloaded ones, so the visual
+-- noise lives only on the books that would actually cost bandwidth to
+-- open.  Sized to the glyph + tight padding so the badge can't end up
+-- smaller than its contents.
+--
+-- Returns: badge_widget, width, height — caller uses w/h to offset the
+-- badge into the cover's bottom-right corner via OverlapGroup.
+local function _cloudBadge()
+    local pad = 0                       -- glyph sits right up to the border
+    local fs  = Screen:scaleBySize(5)   -- tight, unobtrusive corner badge
+    local txt = TextWidget:new{
+        text    = "\u{25BC}",   -- ▼ black down-pointing triangle
+        face    = Font:getFace("cfont", fs),
+        bold    = false,
+        fgcolor = Blitbuffer.COLOR_BLACK,
+    }
+    -- Force a square frame by taking the wider of the two glyph axes
+    -- and padding symmetrically — the triangle glyph itself is wider
+    -- than tall, so without the max() the badge came out as a short
+    -- rectangle.  The CenterContainer handles the extra vertical slack.
+    local sz   = txt:getSize()
+    local side = math.max(sz.w, sz.h) + 2 * pad
+    local badge = FrameContainer:new{
+        dimen      = Geom:new{ w = side, h = side },
+        bordersize = Size.border.thin,
+        color      = Blitbuffer.COLOR_DARK_GRAY,
+        background = Blitbuffer.COLOR_WHITE,
+        radius     = Screen:scaleBySize(2),
+        padding    = 0,
+        CenterContainer:new{
+            dimen = Geom:new{ w = side, h = side },
+            txt,
+        },
+    }
+    return badge, side, side
+end
+
 local BookTile = InputContainer:extend{}
 
 -- opts = { book, w, h, cover_w, cover_h, show_progress, progress_style,
---          show_title, title_lines, text_scale, on_tap }
+--          show_title, title_lines, text_scale, show_dl_indicator, on_tap }
 function BookTile:init()
     local o = self.opts
     local book = o.book or {}
@@ -913,6 +988,31 @@ function BookTile:init()
         cover    = _coverPlaceholder(book.title, cov_w, cov_h)
         actual_w = cov_w
         actual_h = cov_h
+    end
+
+    -- Cloud-only indicator: small square in the cover's bottom-right
+    -- corner, added when the caller has decided the book exists only in
+    -- BookFusion's cloud (not yet downloaded locally).  Lives INSIDE the
+    -- cover bounds (no bleed, no budget impact), so the OverlapGroup
+    -- keeps the same (actual_w × actual_h) as the bare cover — later
+    -- wraps (percentage-overlay badge) can nest on top without having
+    -- to account for it.
+    if o.show_dl_indicator then
+        local ind, iw, ih = _cloudBadge()
+        -- Bottom-right inset from the cover edges.  Bumped on both
+        -- axes so the badge has breathing room from adjacent cover
+        -- art instead of hugging the corner too tightly.
+        local pad_x = Screen:scaleBySize(5)
+        local pad_y = Screen:scaleBySize(6)
+        ind.overlap_offset = {
+            actual_w - iw - pad_x,
+            actual_h - ih - pad_y,
+        }
+        cover = OverlapGroup:new{
+            dimen = Geom:new{ w = actual_w, h = actual_h },
+            cover,
+            ind,
+        }
     end
 
     -- Overlay-badge mode: wrap the cover widget in an OverlapGroup that
@@ -1306,6 +1406,10 @@ function BookFusionTab:_buildLanding(sw, content_h)
     local show_progr  = Settings.showCarouselProgress()
     local show_pager  = Settings.showCarouselPager()
     local progr_style = Settings.progressStyleCarousel()
+    -- Download indicator is only applied per-book inside the tile loop —
+    -- the per-book check is an lfs.attributes call (cheap but not free),
+    -- so hoist the global setting once and skip the call if it's off.
+    local dl_ind_on   = Settings.showDownloadIndicators()
     local use_overlay = show_progr and progr_style == "overlay"
     -- Carousel uses its own cover-scale knob; cr_cols is derived from it
     -- further down (after we know carousel_inner_w and tile_gap).  Smaller
@@ -1466,18 +1570,26 @@ function BookFusionTab:_buildLanding(sw, content_h)
         if i > start_idx then
             tiles[#tiles+1] = HorizontalSpan:new{ width = tile_gap }
         end
+        local book_i = cr_books[i]
         tiles[#tiles+1] = BookTile:new{
             opts = {
-                book           = cr_books[i],
-                w              = tile_w,
-                h              = tile_h,
-                cover_w        = cover_w,   -- explicit so cov_sc scales width too
-                cover_h        = cover_h,
-                show_progress  = show_progr,
-                progress_style = progr_style,
-                show_title     = show_title,
-                text_scale     = txt_sc,
-                on_tap         = function(b) Data.selectBook(b) end,
+                book              = book_i,
+                w                 = tile_w,
+                h                 = tile_h,
+                cover_w           = cover_w,   -- explicit so cov_sc scales width too
+                cover_h           = cover_h,
+                show_progress     = show_progr,
+                progress_style    = progr_style,
+                show_title        = show_title,
+                text_scale        = txt_sc,
+                show_dl_indicator = dl_ind_on and not Data.isDownloaded(book_i),
+                on_tap            = function(b)
+                    Data.selectBook(b, function()
+                        -- File tree changed (download / remove) —
+                        -- rebuild so the cloud indicator catches up.
+                        if not self._closed then self:_rebuildAndRepaint() end
+                    end)
+                end,
             },
         }
     end
@@ -1695,6 +1807,12 @@ function BookFusionTab:_buildSubpage(sw, content_h)
     -- page; both are clamped to 1..6 by the setting readers.
     local grid_cols = Settings.gridCols()
     local rows      = Settings.gridRows()
+    -- Download indicator: global toggle gates everything; the search
+    -- setting is a separate check that only applies in search view.
+    -- See _buildLanding for the same pattern (cached once, lfs check
+    -- happens inside the per-tile loop below).
+    local dl_ind_on = Settings.showDownloadIndicators()
+        and (self._view ~= "search" or Settings.showDownloadIndicatorsSearch())
 
     -- Pager bar (prev / page / next) pinned at the bottom of the subpage.
     -- The subpage's title + back arrow live in the main TitleBar now, so
@@ -1798,18 +1916,24 @@ function BookFusionTab:_buildSubpage(sw, content_h)
         local row = HorizontalGroup:new{ align = "top" }
         for j = i, row_end do
             if j > i then row[#row+1] = HorizontalSpan:new{ width = tile_gap } end
+            local book_j = books[j]
             row[#row+1] = BookTile:new{
                 opts = {
-                    book       = books[j],
-                    w          = tile_w,
-                    h          = tile_h,
-                    cover_w    = cover_w,
-                    cover_h    = cover_h,
-                    show_progress = false,      -- subpages omit progress per spec
-                    show_title    = show_title, -- folder-title visibility toggle
-                    title_lines   = 1,          -- single-line titles on subpages
-                    text_scale    = txt_sc,
-                    on_tap        = function(b) Data.selectBook(b) end,
+                    book              = book_j,
+                    w                 = tile_w,
+                    h                 = tile_h,
+                    cover_w           = cover_w,
+                    cover_h           = cover_h,
+                    show_progress     = false,      -- subpages omit progress per spec
+                    show_title        = show_title, -- folder-title visibility toggle
+                    title_lines       = 1,          -- single-line titles on subpages
+                    text_scale        = txt_sc,
+                    show_dl_indicator = dl_ind_on and not Data.isDownloaded(book_j),
+                    on_tap            = function(b)
+                        Data.selectBook(b, function()
+                            if not self._closed then self:_rebuildAndRepaint() end
+                        end)
+                    end,
                 },
             }
         end
