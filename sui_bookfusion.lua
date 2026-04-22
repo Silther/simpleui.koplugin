@@ -551,7 +551,23 @@ end
 -- Kick off async fetch for each url not yet on disk.  `on_done(url)` fires on
 -- the main thread after each cover is cached — caller repaints the tile.
 -- Returns a halt fn that cancels the pending queue.
-function Covers.fetchMissing(urls, on_done)
+--
+-- Pacing (mirrors the upstream bf_covermenu → bf_image_loader flow):
+--   • 1 s deferral BEFORE the first download — lets rapid page flips /
+--     view changes cancel the batch before any HTTP traffic happens.
+--     Without this, tapping through several pages in a row kicks off
+--     N batches whose Trapper subprocesses then get dismissed by the
+--     user's next tap, wasting bandwidth and leaving covers uncached.
+--     Only meaningful when the caller is one of several fast-firing
+--     triggers (e.g. search pagination).  For an unambiguous single
+--     trigger like the manual ↻ sync, pass `opts.defer = false` to
+--     skip the 1 s stall.
+--   • 0.2 s gap between consecutive downloads — already provided inside
+--     bf_image_loader's Batch:loadImages, nothing to do for it here.
+--
+-- opts (optional): { defer = boolean }
+--   defer (default true) — when false, start downloads immediately.
+function Covers.fetchMissing(urls, on_done, opts)
     local ok_cc, CC = pcall(require, "bf_covercache")
     if not ok_cc or not CC then return function() end end
     local missing = {}
@@ -562,13 +578,36 @@ function Covers.fetchMissing(urls, on_done)
     if #missing == 0 then return function() end end
     local ok_il, ImageLoader = pcall(require, "bf_image_loader")
     if not ok_il or not ImageLoader then return function() end end
-    local _batch, halt = ImageLoader:loadImages(missing, function(url, content)
-        if content and #content > 0 then
-            CC.write(url, content)
-            if on_done then on_done(url) end
+
+    local defer = not (opts and opts.defer == false)
+    local cancelled = false
+    local inner_halt
+    local start_fn
+    start_fn = function()
+        if cancelled then return end
+        local _batch, halt = ImageLoader:loadImages(missing, function(url, content)
+            if content and #content > 0 then
+                CC.write(url, content)
+                if on_done then on_done(url) end
+            end
+        end)
+        inner_halt = halt
+    end
+    if defer then
+        UIManager:scheduleIn(1, start_fn)
+    else
+        start_fn()
+    end
+
+    return function()
+        cancelled = true
+        -- unschedule is cheap and a no-op if start_fn already fired or
+        -- was never scheduled (immediate-mode).
+        if defer then
+            pcall(function() UIManager:unschedule(start_fn) end)
         end
-    end)
-    return halt or function() end
+        if inner_halt then pcall(inner_halt) end
+    end
 end
 
 -- Drop the BB cache (called on widget close so memory is freed).
@@ -586,32 +625,22 @@ end
 -- ---------------------------------------------------------------------------
 -- BookTile: cover + title + optional progress.  One InputContainer per tile
 -- so each tile owns its tap gesture.  Uses a cover thumbnail when available;
--- falls back to a typographic placeholder (first two chars of the title).
+-- falls back to the BookFusion plugin's missing-image glyph placeholder.
 -- ===========================================================================
 
 local COLOR_COVER_BORDER = Blitbuffer.COLOR_BLACK
 local COVER_BORDER_SIZE  = 2  -- px; bumped from 1 for a slightly stronger outline
-local COLOR_COVER_BG     = Blitbuffer.gray(0.95)
 -- Match module_currently's palette so the progress bar looks identical to
 -- the Home tab's Currently Reading card (module_currently.lua:47-49).
 local COLOR_BAR_BG       = Blitbuffer.gray(0.15)  -- dark track
 local COLOR_BAR_FG       = Blitbuffer.gray(0.75)  -- light fill
 
--- Grab the first N UTF-8 characters of s (byte-safe).
-local function _firstChars(s, n)
-    if not s or s == "" then return "?" end
-    local out, count, i = {}, 0, 1
-    while i <= #s and count < n do
-        local byte = s:byte(i)
-        local len = byte >= 240 and 4 or byte >= 224 and 3 or byte >= 192 and 2 or 1
-        out[#out + 1] = s:sub(i, i + len - 1)
-        count = count + 1
-        i = i + len
-    end
-    return table.concat(out)
-end
-
-local function _coverPlaceholder(title, w, h)
+-- Placeholder for a book with no cached cover — matches the official
+-- BookFusion plugin's style (bf_listmenu.lua:199-225): a bordered box
+-- containing a single centered "missing image" glyph, U+26F6 (SQUARE
+-- FOUR CORNERS).  No background fill, no title initials.  The `title`
+-- arg is kept on the signature for caller compatibility but ignored.
+local function _coverPlaceholder(title, w, h)  -- luacheck: no unused args
     -- Inner size must account for the 1px border so the FrameContainer's
     -- actual rendered outer size matches `w × h` exactly.  (FrameContainer
     -- computes its size as content_size + 2*bordersize.)  Using `w × h` for
@@ -620,15 +649,13 @@ local function _coverPlaceholder(title, w, h)
     local bw = COVER_BORDER_SIZE
     return FrameContainer:new{
         bordersize = bw, color = COLOR_COVER_BORDER,
-        background = COLOR_COVER_BG,
         padding = 0, margin = 0,
         dimen = Geom:new{ w = w, h = h },
         CenterContainer:new{
             dimen = Geom:new{ w = w - 2 * bw, h = h - 2 * bw },
             TextWidget:new{
-                text = _firstChars(title or "?", 2):upper(),
-                face = Font:getFace("smallinfofont", Screen:scaleBySize(20)),
-                bold = true,
+                text = "\u{26F6}",
+                face = Font:getFace("cfont", Screen:scaleBySize(20)),
             },
         },
     }
@@ -2222,7 +2249,11 @@ function BookFusionTab:_refreshLists(force)
                     timeout = 3,
                 })
             end
-            self:_prefetchVisibleCovers()
+            -- Prefetch covers for all three cached folders, Currently
+            -- Reading first, so the user's first stop (landing carousel)
+            -- warms before any drill-downs fetch from cache.  Same
+            -- behaviour no matter which view was active when ↻ was tapped.
+            self:_prefetchAllCovers()
         end
         local function step()
             idx = idx + 1
@@ -2250,7 +2281,11 @@ function BookFusionTab:_refreshLists(force)
     end)
 end
 
--- Kick off async downloads for the covers currently on screen.
+-- Kick off async downloads for the covers currently on screen.  Used by
+-- the search flow (_enterSearch, search-paginate) where the only relevant
+-- cover set is the in-memory search_results page.  The manual ↻ sync
+-- instead calls _prefetchAllCovers so the user sees freshly-cached
+-- covers across every folder on their next drill-down.
 function BookFusionTab:_prefetchVisibleCovers()
     if self._cover_halt then pcall(self._cover_halt); self._cover_halt = nil end
     local books = {}
@@ -2278,6 +2313,34 @@ function BookFusionTab:_prefetchVisibleCovers()
         if self._closed then return end
         self:_rebuildAndRepaint()
     end)
+end
+
+-- Queue cover downloads for ALL three cached folder lists so a manual
+-- sync warms every folder's thumbnails regardless of which view the
+-- user had open when they tapped ↻.  Order matters — bf_image_loader
+-- processes the queue sequentially with a 0.2 s gap between requests,
+-- so listing Currently Reading first ensures the visible carousel
+-- fills before the user navigates anywhere else.
+function BookFusionTab:_prefetchAllCovers()
+    if self._cover_halt then pcall(self._cover_halt); self._cover_halt = nil end
+    local urls = {}
+    local function _pushFrom(key)
+        local slot = Cache.get(key)
+        local list = (slot and slot.books) or {}
+        for i = 1, #list do
+            local u = list[i] and list[i].cover_url
+            if u and u ~= "" then urls[#urls+1] = u end
+        end
+    end
+    _pushFrom("currently_reading")
+    _pushFrom("planned_to_read")
+    _pushFrom("favorites")
+    -- Manual ↻ is a single unambiguous trigger — no need for the 1 s
+    -- debounce that protects rapid-trigger callers (search pagination).
+    self._cover_halt = Covers.fetchMissing(urls, function(_url)
+        if self._closed then return end
+        self:_rebuildAndRepaint()
+    end, { defer = false })
 end
 
 -- ---------------------------------------------------------------------------
