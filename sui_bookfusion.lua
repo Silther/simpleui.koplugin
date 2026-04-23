@@ -2588,6 +2588,24 @@ function BookFusionTab:onShow()
     -- their lives with Wi-Fi off (battery life, airplane mode).  Silent
     -- background syncs would pop the KOReader Wi-Fi prompt every time they
     -- switch to the tab — noisy and surprising.
+
+    -- Unregister the `simpleui_menu_tap` touch zone that sui_patches
+    -- attached to this widget during `patchUIManagerShow`
+    -- (sui_patches.lua:1338-1346).  With it in place, any tap in the top
+    -- 1/8 of the screen fires `FileManagerMenu:onTapShowMenu` BEFORE
+    -- our title-bar icons' ges_events get a chance, because
+    -- `applyGesturePriorityHandleEvent` makes `InputContainer.onGesture`
+    -- (which walks `_ordered_touch_zones`) run before child propagation.
+    -- The Library tab doesn't hit this problem because FM's equivalent
+    -- menu-open zone lives on its `FileManagerMenu` child module, not
+    -- on FM itself, so icons fire first via child propagation.
+    -- Removing the zone on the BF tab makes dispatch fall back to the
+    -- Library-tab flow: child title-bar icons consume their taps
+    -- normally.  Users can still reach the KOReader main menu via the
+    -- swipe-down gesture (simpleui_menu_swipe is left registered).
+    if self.unRegisterTouchZones then
+        pcall(self.unRegisterTouchZones, self, { { id = "simpleui_menu_tap" } })
+    end
 end
 
 function BookFusionTab:onCloseWidget()
