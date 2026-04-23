@@ -606,6 +606,14 @@ end
 --   • 0.2 s gap between consecutive downloads — already provided inside
 --     bf_image_loader's Batch:loadImages, nothing to do for it here.
 --
+-- Dismissal recovery: `bf_image_loader` runs each HTTP fetch inside
+-- Trapper:dismissableRunInSubprocess, so any UI event during a fetch
+-- kills it and the URL stays un-cached.  We catch this by polling the
+-- batch's `loading` flag; once it flips to false we diff the original
+-- missing list against disk and, if anything's still not there, fire a
+-- retry batch on just those URLs.  Bounded at 3 total passes to cap
+-- the pathological "user never stops interacting" case.
+--
 -- opts (optional): { defer = boolean }
 --   defer (default true) — when false, start downloads immediately.
 function Covers.fetchMissing(urls, on_done, opts)
@@ -620,19 +628,52 @@ function Covers.fetchMissing(urls, on_done, opts)
     local ok_il, ImageLoader = pcall(require, "bf_image_loader")
     if not ok_il or not ImageLoader then return function() end end
 
+    local MAX_PASSES = 3
+    local POLL_INTERVAL = 1.0
     local defer = not (opts and opts.defer == false)
     local cancelled = false
     local inner_halt
+    local current_batch
+    local passes = 0
+    local poll_fn
+    local start_pass  -- forward-decl for closure reference from poll_fn
+
+    local function on_fetch(url, content)
+        if content and #content > 0 then
+            CC.write(url, content)
+            if on_done then on_done(url) end
+        end
+    end
+
+    start_pass = function(url_list)
+        passes = passes + 1
+        local batch, halt = ImageLoader:loadImages(url_list, on_fetch)
+        current_batch = batch
+        inner_halt    = halt
+        UIManager:scheduleIn(POLL_INTERVAL, poll_fn)
+    end
+
+    poll_fn = function()
+        if cancelled then return end
+        if not current_batch or current_batch.loading then
+            UIManager:scheduleIn(POLL_INTERVAL, poll_fn)
+            return
+        end
+        if passes >= MAX_PASSES then return end
+        local still_missing = {}
+        for i = 1, #missing do
+            if not CC.read(missing[i]) then
+                still_missing[#still_missing + 1] = missing[i]
+            end
+        end
+        if #still_missing == 0 then return end
+        start_pass(still_missing)
+    end
+
     local start_fn
     start_fn = function()
         if cancelled then return end
-        local _batch, halt = ImageLoader:loadImages(missing, function(url, content)
-            if content and #content > 0 then
-                CC.write(url, content)
-                if on_done then on_done(url) end
-            end
-        end)
-        inner_halt = halt
+        start_pass(missing)
     end
     if defer then
         UIManager:scheduleIn(1, start_fn)
@@ -642,11 +683,10 @@ function Covers.fetchMissing(urls, on_done, opts)
 
     return function()
         cancelled = true
-        -- unschedule is cheap and a no-op if start_fn already fired or
-        -- was never scheduled (immediate-mode).
         if defer then
             pcall(function() UIManager:unschedule(start_fn) end)
         end
+        pcall(function() UIManager:unschedule(poll_fn) end)
         if inner_halt then pcall(inner_halt) end
     end
 end
@@ -2380,10 +2420,6 @@ function BookFusionTab:_refreshLists(force)
         local idx, failed = 0, 0
         local function finish()
             self._refreshing = false
-            if self._sync_popup then
-                pcall(function() UIManager:close(self._sync_popup) end)
-                self._sync_popup = nil
-            end
             if failed > 0 then
                 UIManager:show(InfoMessage:new{
                     text    = _("Couldn't refresh some BookFusion lists."),
@@ -2394,6 +2430,12 @@ function BookFusionTab:_refreshLists(force)
             -- Reading first, so the user's first stop (landing carousel)
             -- warms before any drill-downs fetch from cache.  Same
             -- behaviour no matter which view was active when ↻ was tapped.
+            -- _prefetchAllCovers also owns the sync popup's lifetime
+            -- from here on: it closes the popup exactly when the first
+            -- cover is about to become visible (or immediately if all
+            -- covers are already cached and nothing will actually
+            -- download).  Avoids the previous fixed 3 s delay that was
+            -- a guess rather than a synchronisation point.
             self:_prefetchAllCovers()
         end
         local function step()
@@ -2476,12 +2518,59 @@ function BookFusionTab:_prefetchAllCovers()
     _pushFrom("currently_reading")
     _pushFrom("planned_to_read")
     _pushFrom("favorites")
+
+    -- Sync popup dismissal — captured here (rather than in _refreshLists'
+    -- finish()) so we can tie the close to the first cover landing
+    -- instead of a fixed delay.  popup_to_close holds the instance the
+    -- call started with; if a follow-up sync spawns a new popup later,
+    -- our close won't affect it because we compare identity before
+    -- touching self._sync_popup.
+    local popup_to_close = self._sync_popup
+    local popup_closed = false
+    local function close_popup()
+        if popup_closed then return end
+        popup_closed = true
+        if popup_to_close then
+            pcall(function() UIManager:close(popup_to_close) end)
+            if self._sync_popup == popup_to_close then
+                self._sync_popup = nil
+            end
+        end
+    end
+
+    -- If every cover is already cached on disk, no downloads will run
+    -- and fetchMissing's callback will never fire — close the popup
+    -- immediately so it doesn't hang around with nothing happening.
+    local ok_cc, CC = pcall(require, "bf_covercache")
+    local any_missing = false
+    if ok_cc and CC then
+        for i = 1, #urls do
+            if not CC.read(urls[i]) then any_missing = true; break end
+        end
+    end
+    if not any_missing then
+        close_popup()
+        return
+    end
+
     -- Manual ↻ is a single unambiguous trigger — no need for the 1 s
     -- debounce that protects rapid-trigger callers (search pagination).
     self._cover_halt = Covers.fetchMissing(urls, function(_url)
         if self._closed then return end
+        -- Dismiss the popup right before the rebuild that paints the
+        -- first cover, so the popup "morphs" into the refreshed view
+        -- rather than vanishing into empty space earlier.  No-op on
+        -- subsequent cover callbacks — popup_closed gate.
+        close_popup()
         self:_rebuildAndRepaint()
     end, { defer = false })
+
+    -- Safety net: if the very first fetch is so slow (or everything
+    -- gets dismissed across retries) that no cover lands in a
+    -- reasonable window, close the popup anyway so it doesn't stick
+    -- around indefinitely.  Large budget because we'd rather wait for
+    -- a real cover than dismiss early.
+    UIManager:scheduleIn(20, close_popup)
 end
 
 -- ---------------------------------------------------------------------------
