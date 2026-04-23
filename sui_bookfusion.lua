@@ -62,6 +62,13 @@ local _               = require("gettext")
 local UI     = require("sui_core")
 local Screen = Device.screen
 
+-- Absolute path to this plugin's icons/ directory.  Needed because
+-- IconWidget's search paths (koreader/resources/icons/...) don't cover
+-- plugin-local SVGs, so we load custom icons via ImageWidget with an
+-- explicit `file` path the way sui_config.lua resolves `_P`.
+local _PLUGIN_DIR = (debug.getinfo(1, "S").source or ""):match("^@(.+)/[^/]+$")
+local _ICON_DOWNLOAD = _PLUGIN_DIR and (_PLUGIN_DIR .. "/icons/download.svg")
+
 -- Forward-declare so the widget class can reach `M._instance` in onCloseWidget.
 local M = {}
 M._instance = nil
@@ -938,20 +945,21 @@ end
 -- Returns: badge_widget, width, height — caller uses w/h to offset the
 -- badge into the cover's bottom-right corner via OverlapGroup.
 local function _cloudBadge()
-    local pad = 0                       -- glyph sits right up to the border
-    local fs  = Screen:scaleBySize(5)   -- tight, unobtrusive corner badge
-    local txt = TextWidget:new{
-        text    = "\u{25BC}",   -- ▼ black down-pointing triangle
-        face    = Font:getFace("cfont", fs),
-        bold    = false,
-        fgcolor = Blitbuffer.COLOR_BLACK,
+    -- Custom SVG icon (icons/cloud-download.svg) rendered via
+    -- ImageWidget — the glyph-based approach (☁ / ▼) can't express a
+    -- cloud-with-down-arrow without the system font cooperating, which
+    -- most cfont builds don't.  alpha = true preserves the SVG's
+    -- transparent background so the badge's white fill shows through
+    -- wherever the icon doesn't paint.
+    local icon_size = Screen:scaleBySize(20)
+    local side      = icon_size
+    local icon = ImageWidget:new{
+        file         = _ICON_DOWNLOAD,
+        alpha        = true,
+        scale_factor = 0,             -- fit to width × height
+        width        = icon_size,
+        height       = icon_size,
     }
-    -- Force a square frame by taking the wider of the two glyph axes
-    -- and padding symmetrically — the triangle glyph itself is wider
-    -- than tall, so without the max() the badge came out as a short
-    -- rectangle.  The CenterContainer handles the extra vertical slack.
-    local sz   = txt:getSize()
-    local side = math.max(sz.w, sz.h) + 2 * pad
     local badge = FrameContainer:new{
         dimen      = Geom:new{ w = side, h = side },
         bordersize = Size.border.thin,
@@ -961,7 +969,7 @@ local function _cloudBadge()
         padding    = 0,
         CenterContainer:new{
             dimen = Geom:new{ w = side, h = side },
-            txt,
+            icon,
         },
     }
     return badge, side, side
