@@ -681,6 +681,15 @@ local function _coverPlaceholder(title, w, h)  -- luacheck: no unused args
     -- the CenterContainer's dimen would make the placeholder 2px wider and
     -- 2px taller than a real cover, causing subtle misalignment.
     local bw = COVER_BORDER_SIZE
+    -- Glyph size tracks the placeholder's height.  Upstream's
+    -- _fontSize(20) at bf_listmenu.lua:142-146 is
+    -- `nominal × cell_h / 64`; we halve the nominal (10 instead of 20)
+    -- so the glyph takes about 15 % of the cell instead of 30 %.
+    -- Floor of 6 so very small cells still render something readable.
+    -- Font:getFace applies scaleBySize internally, so we pass the
+    -- already-cell-proportional value without any further
+    -- scaleBySize() wrapping.
+    local glyph_fs = math.max(6, math.floor(10 * h / 64))
     return FrameContainer:new{
         bordersize = bw, color = COLOR_COVER_BORDER,
         padding = 0, margin = 0,
@@ -689,7 +698,7 @@ local function _coverPlaceholder(title, w, h)  -- luacheck: no unused args
             dimen = Geom:new{ w = w - 2 * bw, h = h - 2 * bw },
             TextWidget:new{
                 text = "\u{26F6}",
-                face = Font:getFace("cfont", Screen:scaleBySize(20)),
+                face = Font:getFace("cfont", glyph_fs),
             },
         },
     }
